@@ -1,0 +1,17 @@
+.git/
+.gitignore
+.dockerignore
+.github/
+__pycache__/
+*.pyc
+data/
+tests/
+node_modules/
+.DS_Store
+README.md
+LICENSE
+SECURITY.md
+CHANGELOG.md
+CODE_OF_CONDUCT.md
+AGENTS.md
+parser.js

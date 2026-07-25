@@ -1,0 +1,14 @@
+services:
+  coding-plan-quota-dashboard:
+    image: python:3.13-alpine
+    container_name: coding-plan-quota-dashboard
+    network_mode: host
+    environment:
+      PORT: "8080"
+      APP_REVISION: "2026-07-14-codex-agentplan-fix"
+    command: ["python", "/srv/server.py"]
+    volumes:
+      - /docker/coding_plan_quota_dashboard/index.html:/srv/index.html:ro
+      - /docker/coding_plan_quota_dashboard/server.py:/srv/server.py:ro
+      - /docker/coding_plan_quota_dashboard/data:/data
+    restart: unless-stopped

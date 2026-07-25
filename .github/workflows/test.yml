@@ -1,0 +1,45 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  parser:
+    name: Parser (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Show tool versions
+        run: |
+          node --version
+          npm --version
+      - name: Run parser tests
+        run: node --test tests/parser.test.js
+
+  server:
+    name: Server (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Show tool versions
+        run: |
+          python3 --version
+          python3 -c "import unittest, json, urllib.request; print('stdlib OK')"
+      - name: Compile server.py
+        run: python3 -m py_compile server.py
+      - name: Run server tests
+        run: PYTHONPATH=. python3 -m unittest discover -s tests -p 'test_*.py' -v
