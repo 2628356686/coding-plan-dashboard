@@ -5,9 +5,15 @@ import json
 import os
 import re
 import shlex
+import time
+import random
 import uuid
+import math
+from contextlib import contextmanager, ExitStack
+from threading import RLock, Thread, Event
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.client import HTTPException
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlparse
 from urllib.error import HTTPError, URLError
@@ -484,6 +490,650 @@ def execute_curl(command):
         return 1, "", str(error.reason)
 
 
+
+# ============================================================================
+# Gateway: multi-protocol reverse proxy with quota-weighted routing
+# ============================================================================
+
+GATEWAY_CONFIG_PATH = Path(os.environ.get("GATEWAY_CONFIG_PATH", "/data/gateway.json"))
+GATEWAY_STATS_PATH = Path(os.environ.get("GATEWAY_STATS_PATH", "/data/gateway_stats.json"))
+GATEWAY_COOLDOWN_SECONDS = 60
+
+# Map account source to upstream plan category
+SOURCE_TO_CATEGORY = {
+    "volcAgent": "agentPlan",
+    "volcCoding": "codingPlan",
+}
+
+
+def gateway_category_for_account(acc):
+    """Infer upstream category from account source; default agentPlan."""
+    source = acc.get("source", "") if isinstance(acc, dict) else ""
+    return SOURCE_TO_CATEGORY.get(source, "agentPlan")
+
+_gateway_cooldowns = {}  # account_id -> expiry epoch
+_gateway_stats = {"total_requests": 0, "by_account": {}}
+_gateway_active = {}
+_gateway_active_lock = RLock()
+_gateway_quota_cache = {}
+
+
+class GatewayRetry(Exception):
+    """Upstream failed before any downstream headers were sent."""
+
+
+def normalize_gateway_quota(payload):
+    """Normalize the two supported Volcengine gateway quota responses."""
+    value = payload.get("Result", payload.get("data", payload))
+    periods = []
+    for name in ("AFPFiveHour", "AFPWeekly", "AFPMonthly"):
+        item = value.get(name)
+        if isinstance(item, dict) and item.get("Quota") is not None and item.get("Used") is not None:
+            quota, used = float(item["Quota"]), float(item["Used"])
+            periods.append({"usedPercent": used / quota * 100 if quota > 0 else 100})
+    if not periods:
+        for item in value.get("QuotaUsage", []):
+            if isinstance(item, dict) and item.get("Percent") is not None:
+                periods.append({"usedPercent": float(str(item["Percent"]).rstrip("%"))})
+    if not periods:
+        raise ValueError("quota response has no supported periods")
+    if any(not math.isfinite(p["usedPercent"]) or p["usedPercent"] < 0 for p in periods):
+        raise ValueError("quota response contains invalid percentages")
+    return {"periods": periods, "updatedAt": now_iso()}
+
+
+def refresh_gateway_quotas(accounts):
+    for aid, account in accounts.items():
+        if not isinstance(account, dict):
+            continue
+        if (account.get("source") not in SOURCE_TO_CATEGORY or not account.get("apiKey")
+                or (account.get("gateway") or {}).get("enabled") is False or not account.get("curl")):
+            continue
+        try:
+            status, body, _ = execute_curl(account["curl"])
+            if not is_success_status(status):
+                continue
+            quota = normalize_gateway_quota(json.loads(body))
+            with _gateway_active_lock:
+                _gateway_quota_cache[aid] = quota
+        except (ValueError, TypeError, AttributeError, OSError):
+            # Keep the last known quota when credentials or the endpoint fail.
+            continue
+
+
+def gateway_routing_snapshot(snapshot):
+    result = dict(snapshot)
+    def updated(value):
+        try:
+            return datetime.fromisoformat(value.get("updatedAt", "").replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError, AttributeError):
+            return 0
+    with _gateway_active_lock:
+        for aid, quota in _gateway_quota_cache.items():
+            if updated(quota) >= updated(result.get(aid, {})):
+                result[aid] = quota
+    return result
+
+
+def gateway_quota_worker(requests_path, stop):
+    while not stop.is_set():
+        try:
+            if load_gateway_config().get("enabled"):
+                refresh_gateway_quotas(load_requests(requests_path))
+        except (ValueError, OSError):
+            pass
+        stop.wait(60)
+
+
+@contextmanager
+def reserve_gateway_account(accounts, snapshot, model, protocol, stream):
+    # Selection and reservation share a lock so simultaneous requests see each other.
+    with ExitStack() as stack:
+        with _gateway_active_lock:
+            aid, account = select_gateway_account(accounts, gateway_routing_snapshot(snapshot))
+            if aid:
+                stack.enter_context(track_gateway_request(aid, account, model, protocol, stream))
+        yield aid, account
+
+
+@contextmanager
+def track_gateway_request(account_id, account, model, protocol, stream):
+    request_id = uuid.uuid4().hex
+    entry = {
+        "id": request_id, "accountId": account_id,
+        "accountLabel": account.get("label") or account.get("accountId") or account_id,
+        "model": model, "protocol": protocol, "stream": bool(stream),
+        "startedAt": now_iso(), "startedMonotonic": time.monotonic(),
+    }
+    with _gateway_active_lock:
+        _gateway_active[request_id] = entry
+    try:
+        yield
+    finally:
+        with _gateway_active_lock:
+            _gateway_active.pop(request_id, None)
+
+
+def gateway_active_snapshot():
+    with _gateway_active_lock:
+        now = time.monotonic()
+        active = [dict(
+            {k: v for k, v in entry.items() if k != "startedMonotonic"},
+            elapsedSeconds=round(max(0, now - entry["startedMonotonic"]), 1),
+        ) for entry in _gateway_active.values()]
+    return {"activeCount": len(active), "activeRequests": active}
+
+
+def load_gateway_config():
+    default = {
+        "enabled": False,
+        "apiKey": "",
+        "defaultModel": "",
+        "maxRetries": 3,
+        "upstreams": {
+            "agentPlan": {
+                "anthropicBaseUrl": "https://ark.cn-beijing.volces.com/api/plan",
+                "openaiBaseUrl": "https://ark.cn-beijing.volces.com/api/plan/v3",
+            },
+            "codingPlan": {
+                "anthropicBaseUrl": "https://ark.cn-beijing.volces.com/api/coding",
+                "openaiBaseUrl": "https://ark.cn-beijing.volces.com/api/coding/v3",
+            },
+        },
+    }
+    try:
+        data = json.loads(GATEWAY_CONFIG_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            merged = dict(default)
+            merged.update({k: v for k, v in data.items() if k != "upstreams"})
+            upstreams = {k: dict(v) for k, v in default["upstreams"].items()}
+            if isinstance(data.get("upstreams"), dict):
+                for k, v in data["upstreams"].items():
+                    if k in upstreams and isinstance(v, dict):
+                        upstreams[k].update(v)
+            merged["upstreams"] = upstreams
+            return merged
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return default
+
+
+def save_gateway_config(config):
+    save_snapshot(str(GATEWAY_CONFIG_PATH), config)
+
+
+def load_gateway_stats():
+    try:
+        data = json.loads(GATEWAY_STATS_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return {"total_requests": 0, "by_account": {}}
+
+
+def save_gateway_stats(stats):
+    save_snapshot(str(GATEWAY_STATS_PATH), stats)
+
+
+def account_remaining_percent(account_id, snapshot):
+    """Return remaining-quota percentage (0-100); 50 when no data."""
+    data = snapshot.get(account_id)
+    if not isinstance(data, dict):
+        return 50.0
+    used_percents = []
+    for period in data.get("periods") or []:
+        if isinstance(period, dict):
+            p = period.get("usedPercent")
+            if isinstance(p, (int, float)):
+                used_percents.append(p)
+    for window in data.get("windows") or []:
+        if isinstance(window, dict):
+            p = window.get("usedPercent")
+            if isinstance(p, (int, float)):
+                used_percents.append(p)
+    p = data.get("usedPercent")
+    if isinstance(p, (int, float)):
+        used_percents.append(p)
+    if used_percents:
+        used = max(used_percents)
+    elif (isinstance(data.get("used"), (int, float))
+          and isinstance(data.get("limit"), (int, float))
+          and data["limit"] > 0):
+        used = data["used"] / data["limit"] * 100
+    else:
+        return 50.0
+    return max(0.0, min(100.0, 100.0 - used))
+
+
+def gateway_concurrency_limit(account):
+    value = (account.get("gateway") or {}).get("maxConcurrency", 1)
+    return value if type(value) is int and 1 <= value <= 10 else 1
+
+
+def select_gateway_account(accounts, snapshot):
+    """Weighted-random pick by remaining quota. Returns (aid, acc) or (None, None)."""
+    now = time.time()
+    candidates = []
+    weights = []
+    with _gateway_active_lock:
+        active_counts = {}
+        for entry in _gateway_active.values():
+            aid = entry["accountId"]
+            active_counts[aid] = active_counts.get(aid, 0) + 1
+    for aid, acc in accounts.items():
+        if not isinstance(acc, dict):
+            continue
+        gw = acc.get("gateway") or {}
+        if gw.get("enabled") is False:
+            continue
+        if not str(acc.get("apiKey", "")).strip():
+            continue
+        if now < _gateway_cooldowns.get(aid, 0):
+            continue
+        if active_counts.get(aid, 0) >= gateway_concurrency_limit(acc):
+            continue
+        remaining = account_remaining_percent(aid, snapshot)
+        if remaining <= 0:
+            continue
+        weight = (remaining / 100.0) * (gateway_concurrency_limit(acc) - active_counts.get(aid, 0))
+        candidates.append(aid)
+        weights.append(weight)
+    if not candidates:
+        return None, None
+    chosen = random.choices(candidates, weights=weights, k=1)[0]
+    return chosen, accounts[chosen]
+
+
+def cooldown_account(account_id, seconds=GATEWAY_COOLDOWN_SECONDS):
+    with _gateway_active_lock:
+        _gateway_cooldowns[account_id] = time.time() + seconds
+
+
+def record_gateway_request(account_id):
+    with _gateway_active_lock:
+        _gateway_stats["total_requests"] = _gateway_stats.get("total_requests", 0) + 1
+        by_acc = _gateway_stats.setdefault("by_account", {})
+        by_acc[account_id] = by_acc.get(account_id, 0) + 1
+
+
+# ---- Protocol conversion (inbound -> OpenAI upstream) ----
+
+def anthropic_to_openai(body):
+    messages = []
+    if body.get("system"):
+        sys_content = body["system"]
+        if isinstance(sys_content, list):
+            sys_text = "".join(
+                item.get("text", "") for item in sys_content if isinstance(item, dict)
+            )
+        else:
+            sys_text = str(sys_content)
+        messages.append({"role": "system", "content": sys_text})
+    for msg in body.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = [
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ]
+            content = "".join(text_parts)
+        messages.append({"role": role, "content": content})
+    result = {"messages": messages}
+    for key in ("model", "max_tokens", "temperature", "top_p", "stream"):
+        if body.get(key) is not None:
+            result[key] = body[key]
+    return result
+
+
+def openai_to_anthropic(body, model):
+    choice = (body.get("choices") or [{}])[0]
+    message = choice.get("message", {})
+    content = message.get("content", "") or ""
+    return {
+        "id": body.get("id", "msg_" + uuid.uuid4().hex[:16]),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": content}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": body.get("usage", {}).get("prompt_tokens", 0),
+            "output_tokens": body.get("usage", {}).get("completion_tokens", 0),
+        },
+    }
+
+
+def responses_to_openai(body):
+    messages = []
+    if body.get("instructions"):
+        messages.append({"role": "system", "content": str(body["instructions"])})
+    user_input = body.get("input", "")
+    if isinstance(user_input, list):
+        text_parts = []
+        for item in user_input:
+            if isinstance(item, dict):
+                if item.get("type") == "message" or "role" in item:
+                    content = item.get("content", [])
+                    if isinstance(content, str):
+                        messages.append({"role": item.get("role", "user"), "content": content})
+                        continue
+                    item_text = []
+                    for c in item.get("content", []):
+                        if isinstance(c, dict) and c.get("type") in ("input_text", "output_text"):
+                            item_text.append(c.get("text", ""))
+                    messages.append({"role": item.get("role", "user"), "content": "".join(item_text)})
+                elif item.get("type") == "input_text":
+                    text_parts.append(item.get("text", ""))
+        user_input = "".join(text_parts)
+    if user_input:
+        messages.append({"role": "user", "content": str(user_input)})
+    result = {"messages": messages}
+    for key in ("model", "temperature", "top_p", "stream"):
+        if body.get(key) is not None:
+            result[key] = body[key]
+    if body.get("max_output_tokens"):
+        result["max_tokens"] = body["max_output_tokens"]
+    return result
+
+
+def openai_to_responses(body, model):
+    choice = (body.get("choices") or [{}])[0]
+    message = choice.get("message", {})
+    content = message.get("content", "") or ""
+    return {
+        "id": body.get("id", "resp_" + uuid.uuid4().hex[:16]),
+        "object": "response",
+        "model": model,
+        "created_at": int(time.time()),
+        "status": "completed",
+        "output": [{
+            "id": "msg_" + uuid.uuid4().hex,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content, "annotations": []}],
+        }],
+        "usage": {
+            "input_tokens": body.get("usage", {}).get("prompt_tokens", 0),
+            "output_tokens": body.get("usage", {}).get("completion_tokens", 0),
+            "total_tokens": body.get("usage", {}).get("total_tokens", 0),
+        },
+    }
+
+
+def iter_sse_data(stream):
+    """Read complete SSE frames without waiting for the upstream body to end."""
+    data = []
+    for raw_line in stream:
+        line = raw_line.decode("utf-8").rstrip("\r\n")
+        if not line:
+            if data:
+                yield "\n".join(data)
+                data = []
+        elif line.startswith("data:"):
+            value = line[5:]
+            data.append(value[1:] if value.startswith(" ") else value)
+
+
+def gateway_responses_stream(stream, protocol, model):
+    """Translate upstream text deltas immediately into Responses SSE events."""
+    response = {
+        "id": "resp_" + uuid.uuid4().hex, "object": "response",
+        "created_at": int(time.time()), "model": model, "status": "in_progress",
+        "output": [], "error": None, "incomplete_details": None, "usage": None,
+    }
+    sequence = 0
+
+    def emit(kind, **fields):
+        nonlocal sequence
+        payload = dict(type=kind, sequence_number=sequence, **fields)
+        sequence += 1
+        return ("event: " + kind + "\ndata: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+    yield emit("response.created", response=response)
+    yield emit("response.in_progress", response=response)
+    item = None
+    part = None
+    fields = None
+    terminal = False
+    finish_reason = None
+    usage = {}
+    try:
+        for data in iter_sse_data(stream):
+            if protocol == "openai" and data == "[DONE]":
+                terminal = True
+                break
+            chunk = json.loads(data)
+            if not isinstance(chunk, dict) or chunk.get("error") or chunk.get("type") == "error":
+                raise ValueError("upstream stream error")
+            text_delta = ""
+            if protocol == "openai":
+                if chunk.get("usage"):
+                    usage.update(chunk["usage"])
+                for choice in chunk.get("choices", []):
+                    if choice.get("index", 0) != 0:
+                        continue
+                    delta = choice.get("delta") or {}
+                    text_delta += delta.get("content") or ""
+                    if delta.get("tool_calls") or delta.get("refusal"):
+                        raise ValueError("unsupported upstream output")
+                    finish_reason = choice.get("finish_reason") or finish_reason
+            else:
+                kind = chunk.get("type")
+                if kind == "message_start":
+                    usage.update(chunk.get("message", {}).get("usage") or {})
+                elif kind == "content_block_start":
+                    block = chunk.get("content_block") or {}
+                    if block.get("type") == "tool_use":
+                        raise ValueError("unsupported upstream output")
+                    if block.get("type") == "text":
+                        text_delta = block.get("text", "")
+                elif kind == "content_block_delta":
+                    delta = chunk.get("delta") or {}
+                    if delta.get("type") == "text_delta":
+                        text_delta = delta.get("text", "")
+                elif kind == "message_delta":
+                    usage.update(chunk.get("usage") or {})
+                    finish_reason = chunk.get("delta", {}).get("stop_reason") or finish_reason
+                elif kind == "message_stop":
+                    terminal = True
+                    break
+            if text_delta:
+                if item is None:
+                    item = {"id": "msg_" + uuid.uuid4().hex, "type": "message",
+                            "role": "assistant", "status": "in_progress", "content": []}
+                    response["output"].append(item)
+                    yield emit("response.output_item.added", output_index=0, item=item)
+                    part = {"type": "output_text", "text": "", "annotations": []}
+                    item["content"].append(part)
+                    fields = dict(item_id=item["id"], output_index=0, content_index=0)
+                    yield emit("response.content_part.added", **fields, part=part)
+                part["text"] += text_delta
+                yield emit("response.output_text.delta", **fields, delta=text_delta)
+        if not terminal:
+            raise ValueError("upstream stream ended before its terminal event")
+    except (ValueError, OSError, HTTPException):
+        # Headers have already been sent; failures must remain SSE events.
+        response["status"] = "failed"
+        response["error"] = {"code": "upstream_stream_error", "message": "Upstream stream failed or ended unexpectedly"}
+        yield emit("response.failed", response=response)
+        return
+
+    incomplete = finish_reason in ("length", "max_tokens", "content_filter")
+    response["status"] = "incomplete" if incomplete else "completed"
+    if incomplete:
+        response["incomplete_details"] = {"reason": "content_filter" if finish_reason == "content_filter" else "max_output_tokens"}
+    if item is not None:
+        item["status"] = response["status"]
+        yield emit("response.output_text.done", **fields, text=part["text"])
+        yield emit("response.content_part.done", **fields, part=part)
+        yield emit("response.output_item.done", output_index=0, item=item)
+    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
+    response["usage"] = {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                         "total_tokens": usage.get("total_tokens", input_tokens + output_tokens)}
+    yield emit("response." + response["status"], response=response)
+
+
+def gateway_message_events(message, protocol):
+    """Encode a buffered converted reply using the caller's SSE protocol."""
+    events = []
+
+    def emit(kind, payload):
+        prefix = ("event: " + kind + "\n") if kind else ""
+        events.append(prefix + "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n")
+
+    if protocol == "anthropic":
+        start = dict(message, content=[], stop_reason=None, stop_sequence=None)
+        emit("message_start", {"type": "message_start", "message": start})
+        for index, block in enumerate(message.get("content", [])):
+            emit("content_block_start", {"type": "content_block_start", "index": index,
+                 "content_block": {"type": "text", "text": ""}})
+            emit("content_block_delta", {"type": "content_block_delta", "index": index,
+                 "delta": {"type": "text_delta", "text": block.get("text", "")}})
+            emit("content_block_stop", {"type": "content_block_stop", "index": index})
+        emit("message_delta", {"type": "message_delta", "delta": {
+            "stop_reason": message.get("stop_reason", "end_turn"), "stop_sequence": None},
+            "usage": {"output_tokens": message.get("usage", {}).get("output_tokens", 0)}})
+        emit("message_stop", {"type": "message_stop"})
+    elif protocol == "responses":
+        def response_event(kind, **fields):
+            emit(kind, dict(type=kind, sequence_number=len(events), **fields))
+        response_event("response.created", response=dict(message, status="in_progress", output=[]))
+        response_event("response.in_progress", response=dict(message, status="in_progress", output=[]))
+        for index, item in enumerate(message.get("output", [])):
+            item_id = item["id"]
+            response_event("response.output_item.added", output_index=index,
+                           item=dict(item, status="in_progress", content=[]))
+            for part_index, part in enumerate(item.get("content", [])):
+                fields = dict(item_id=item_id, output_index=index, content_index=part_index)
+                response_event("response.content_part.added", **fields, part=dict(part, text=""))
+                response_event("response.output_text.delta", **fields, delta=part.get("text", ""))
+                response_event("response.output_text.done", **fields, text=part.get("text", ""))
+                response_event("response.content_part.done", **fields, part=part)
+            response_event("response.output_item.done", output_index=index, item=item)
+        response_event("response.completed", response=message)
+    else:
+        common = {k: message[k] for k in ("id", "model")}
+        common.update(object="chat.completion.chunk", created=message.get("created", int(time.time())))
+        for choice in message.get("choices", []):
+            emit(None, dict(common, choices=[{"index": choice.get("index", 0),
+                "delta": choice["message"], "finish_reason": None}]))
+            emit(None, dict(common, choices=[{"index": choice.get("index", 0),
+                "delta": {}, "finish_reason": choice.get("finish_reason", "stop")}]))
+        events.append("data: [DONE]\n\n")
+    return "".join(events).encode("utf-8")
+
+
+# ---- Upstream forwarding ----
+
+
+def openai_to_anthropic_request(body):
+    """OpenAI chat/completions request -> Anthropic messages request."""
+    messages = []
+    system_text = ""
+    for msg in body.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = [
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ]
+            content = "".join(text_parts)
+        if role == "system":
+            system_text = str(content)
+        else:
+            messages.append({"role": role, "content": str(content)})
+    result = {"messages": messages}
+    if system_text:
+        result["system"] = system_text
+    for key in ("model", "max_tokens", "temperature", "top_p", "stream"):
+        if body.get(key) is not None:
+            result[key] = body[key]
+    return result
+
+
+def anthropic_response_to_openai(body, model):
+    """Anthropic messages response -> OpenAI chat/completions response."""
+    content = body.get("content", [])
+    if isinstance(content, list):
+        text = "".join(
+            c.get("text", "") for c in content
+            if isinstance(c, dict) and c.get("type") == "text"
+        )
+    else:
+        text = str(content or "")
+    stop_reason = body.get("stop_reason", "stop")
+    finish = "stop"
+    if stop_reason == "max_tokens":
+        finish = "length"
+    elif stop_reason == "tool_use":
+        finish = "tool_calls"
+    return {
+        "id": body.get("id", "chatcmpl-" + uuid.uuid4().hex[:16]),
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": finish,
+        }],
+        "usage": {
+            "prompt_tokens": body.get("usage", {}).get("input_tokens", 0),
+            "completion_tokens": body.get("usage", {}).get("output_tokens", 0),
+            "total_tokens": sum(body.get("usage", {}).get(k, 0) for k in ("input_tokens", "output_tokens")),
+        },
+    }
+
+
+def gateway_send_upstream(base_url, path, api_key, body_bytes, timeout=120, protocol="openai"):
+    """Return (status, response_file_or_None, error_msg)."""
+    url = base_url.rstrip("/") + path
+    if protocol == "anthropic":
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+    else:
+        headers = {
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+    req = Request(url, data=body_bytes, headers=headers, method="POST")
+    try:
+        resp = urlopen(req, timeout=timeout)
+        return resp.status, resp, ""
+    except HTTPError as e:
+        return e.code, e, "HTTP %d" % e.code
+    except URLError as e:
+        return 0, None, str(e.reason)
+    except (OSError, TimeoutError) as e:
+        return 0, None, str(e)
+
+
+def is_quota_exhausted(status, body_text):
+    if status in (401, 403, 429) or status >= 500:
+        return True
+    lowered = body_text.lower()
+    return any(kw in lowered for kw in (
+        "quota", "exceed", "insufficient", "rate limit",
+        "too many", "余额不足", "额度", "exhausted",
+    ))
+
+
+
 class DashboardHandler(SimpleHTTPRequestHandler):
     snapshot_path = Path(os.environ.get("SNAPSHOT_PATH", "/data/snapshot.json"))
     requests_path = Path(os.environ.get("REQUESTS_PATH", "/data/requests.json"))
@@ -523,6 +1173,18 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/order":
             self.send_json({"order": load_order(self.order_path)})
             return
+        if self.path.split("?")[0] == "/api/gateway/config":
+            self.handle_gateway_config_get()
+            return
+        if self.path == "/api/gateway/status":
+            self.handle_gateway_status()
+            return
+        if self.path == "/api/gateway/active":
+            self.send_json(gateway_active_snapshot())
+            return
+        if self.path in ("/v1/models", "/models"):
+            self.handle_gateway_models()
+            return
         if self.path in ("", "/", "/index.html"):
             html_path = self.index_path
             if html_path.exists():
@@ -537,7 +1199,35 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self):
-        if self.path not in {"/api/snapshot", "/api/requests", "/api/refresh", "/api/order"}:
+        if self.path == "/v1/chat/completions":
+            self.handle_gateway_chat("openai")
+            return
+        if self.path == "/v1/messages":
+            self.handle_gateway_chat("anthropic")
+            return
+        if self.path == "/v1/responses":
+            self.handle_gateway_chat("responses")
+            return
+        if self.path == "/chat/completions":
+            self.handle_gateway_chat("openai")
+            return
+        if self.path == "/messages":
+            self.handle_gateway_chat("anthropic")
+            return
+        if self.path == "/responses":
+            self.handle_gateway_chat("responses")
+            return
+        if self.path == "/api/gateway/config":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 524288:
+                    raise ValueError("invalid payload size")
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                self.handle_gateway_config_post(payload)
+            except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                self.send_error(400, str(error))
+            return
+        if self.path not in {"/api/snapshot", "/api/requests", "/api/refresh", "/api/order", "/api/requests/gateway"}:
             self.send_error(404)
             return
         try:
@@ -547,6 +1237,22 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("snapshot must be an object")
+            if self.path == "/api/requests/gateway":
+                account_id = str(payload.get("id", "")).strip()
+                enabled = payload.get("enabled")
+                if type(enabled) is not bool:
+                    raise ValueError("enabled must be a boolean")
+                accounts = load_requests(self.requests_path)
+                if account_id not in accounts:
+                    self.send_error(404, "account not found")
+                    return
+                account = accounts[account_id]
+                gateway = dict(account.get("gateway") or {})
+                gateway["enabled"] = enabled
+                account["gateway"] = gateway
+                save_requests(self.requests_path, accounts)
+                self.send_json({"ok": True, "id": account_id, "gateway": gateway})
+                return
             if self.path == "/api/snapshot":
                 save_snapshot(self.snapshot_path, payload)
                 self.send_json({"ok": True})
@@ -593,6 +1299,23 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                             definition[_field] = _value
                         elif _field in definition:
                             del definition[_field]
+                if isinstance(existing.get("gateway"), dict):
+                    definition["gateway"] = dict(existing["gateway"])
+                if "gateway" in payload and isinstance(payload["gateway"], dict):
+                    gw_in = payload["gateway"]
+                    gw_existing = definition.get("gateway", {}) if isinstance(definition.get("gateway"), dict) else {}
+                    gw = dict(gw_existing)
+                    if "enabled" in gw_in:
+                        gw["enabled"] = bool(gw_in["enabled"])
+                    if "maxConcurrency" in gw_in:
+                        limit = gw_in["maxConcurrency"]
+                        if type(limit) is not int or not 1 <= limit <= 10:
+                            raise ValueError("每个账号的并发上限必须是 1–10 的整数")
+                        gw["maxConcurrency"] = limit
+                    if gw:
+                        definition["gateway"] = gw
+                    elif "gateway" in definition:
+                        del definition["gateway"]
                 requests[account_id] = definition
                 save_requests(self.requests_path, requests)
                 _save_result = {"ok": True, "id": account_id, "source": source}
@@ -663,6 +1386,409 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
             self.send_error(400, str(error))
 
+
+    def _gateway_authenticate(self, config):
+        auth_header = self.headers.get("Authorization", "")
+        api_key_header = self.headers.get("x-api-key", "")
+        provided = ""
+        if auth_header.startswith("Bearer "):
+            provided = auth_header[7:].strip()
+        elif api_key_header:
+            provided = api_key_header.strip()
+        expected = str(config.get("apiKey", "")).strip()
+        return bool(expected) and provided == expected
+
+    def _gateway_read_body(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > 5242880:
+            raise ValueError("invalid payload size")
+        raw = self.rfile.read(length)
+        return json.loads(raw.decode("utf-8")), raw
+
+    def _gateway_write_json(self, status, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _gateway_stream_openai(self, base_url, path, api_key, body_bytes, protocol="openai", output_protocol=None, model=""):
+        """Make upstream request and stream SSE response back to client in real-time."""
+        url = base_url.rstrip("/") + path
+        headers = {
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        if protocol == "anthropic":
+            headers.pop("Authorization")
+            headers.update({"x-api-key": api_key, "anthropic-version": "2023-06-01"})
+        req = Request(url, data=body_bytes, headers=headers, method="POST")
+        try:
+            resp = urlopen(req, timeout=120)
+        except HTTPError as e:
+            try:
+                body = e.read()
+            finally:
+                e.close()
+            if is_quota_exhausted(e.code, body.decode("utf-8", errors="replace")):
+                raise GatewayRetry("upstream HTTP %d" % e.code) from None
+            self.send_response(e.code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+        except URLError as e:
+            raise GatewayRetry("upstream connection failed") from None
+        except (OSError, TimeoutError) as e:
+            raise GatewayRetry("upstream connection failed") from None
+
+        if "text/event-stream" not in resp.headers.get("Content-Type", "").lower():
+            resp.close()
+            self._gateway_write_json(502, {"error": {"message": "upstream did not return an event stream"}})
+            return True
+        # Send SSE headers immediately
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        # Stream chunks from upstream to client
+        try:
+            if output_protocol == "responses":
+                for event in gateway_responses_stream(resp, protocol, model):
+                    self.wfile.write(event)
+                    self.wfile.flush()
+                return True
+            while True:
+                chunk = resp.read1(4096)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            resp.close()
+        return True
+
+    def handle_gateway_chat(self, inbound_format):
+        """inbound_format: 'openai' | 'anthropic' | 'responses'"""
+        config = load_gateway_config()
+        if not config.get("enabled"):
+            self.send_error(503, "gateway disabled")
+            return
+        if not self._gateway_authenticate(config):
+            self.send_error(401, "invalid gateway api key")
+            return
+        try:
+            body, _raw = self._gateway_read_body()
+            if not isinstance(body, dict):
+                raise ValueError("request body must be a JSON object")
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            self.send_error(400, str(exc))
+            return
+
+        accounts = load_requests(self.requests_path)
+        snapshot = load_snapshot(self.snapshot_path)
+        max_retries = int(config.get("maxRetries", 3))
+        stream = bool(body.get("stream", False))
+        model = body.get("model") or config.get("defaultModel", "")
+        last_error = ""
+
+        for _attempt in range(max_retries):
+            with reserve_gateway_account(accounts, snapshot, model, inbound_format, stream) as (aid, acc):
+                if not aid:
+                    d = self._gateway_diagnostics(accounts)
+                    msg = "no available gateway accounts (accounts may be at concurrency limit, cooling down, or out of quota; total %d, disabled %d, missing apiKey %d)" % (
+                        d["total"], d["disabled"], d["noApiKey"]
+                    )
+                    if last_error:
+                        msg += "; last: " + last_error
+                    self.send_error(503, msg)
+                    return
+                gw = acc.get("gateway") or {}
+                category = gateway_category_for_account(acc)
+                plan_cfg = config.get("upstreams", {}).get(category, {})
+                # Desired upstream protocol matches inbound (responses uses openai endpoint)
+                desired_protocol = "anthropic" if inbound_format == "anthropic" else "openai"
+                url_key = "anthropicBaseUrl" if desired_protocol == "anthropic" else "openaiBaseUrl"
+                base_url = str(plan_cfg.get(url_key, "")).strip()
+                upstream_protocol = desired_protocol
+                # Fallback: if desired protocol URL missing, use the other one with conversion
+                if not base_url:
+                    alt_key = "openaiBaseUrl" if desired_protocol == "anthropic" else "anthropicBaseUrl"
+                    base_url = str(plan_cfg.get(alt_key, "")).strip()
+                    upstream_protocol = "openai" if desired_protocol == "anthropic" else "anthropic"
+                if not base_url:
+                    last_error = "upstream %s has no baseUrl configured" % category
+                    cooldown_account(aid, 30)
+                    continue
+                upstream_key = str(acc.get("apiKey", "")).strip()
+
+                # ---- Request conversion: inbound -> upstream protocol ----
+                if inbound_format == upstream_protocol:
+                    upstream_body = dict(body)
+                elif inbound_format == "openai" and upstream_protocol == "anthropic":
+                    upstream_body = openai_to_anthropic_request(body)
+                elif inbound_format == "anthropic" and upstream_protocol == "openai":
+                    upstream_body = anthropic_to_openai(body)
+                elif inbound_format == "responses" and upstream_protocol == "openai":
+                    upstream_body = responses_to_openai(body)
+                elif inbound_format == "responses" and upstream_protocol == "anthropic":
+                    upstream_body = openai_to_anthropic_request(responses_to_openai(body))
+                else:
+                    upstream_body = dict(body)
+                if not upstream_body.get("model") and model:
+                    upstream_body["model"] = model
+                # Upstream path
+                if upstream_protocol == "anthropic":
+                    upstream_path = "/v1/messages"
+                else:
+                    upstream_path = "/chat/completions"
+                    if not stream:
+                        upstream_body.pop("stream", None)
+
+                # Responses translates upstream SSE incrementally; other cross-
+                # protocol routes still convert complete upstream messages.
+                native_stream = stream and inbound_format == upstream_protocol
+                responses_stream = stream and inbound_format == "responses"
+                upstream_body["stream"] = native_stream or responses_stream
+                upstream_bytes = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
+
+                # True SSE streaming: bypass buffering, stream directly
+                if native_stream or responses_stream:
+                    record_gateway_request(aid)
+                    try:
+                        self._gateway_stream_openai(base_url, upstream_path, upstream_key, upstream_bytes,
+                                                    upstream_protocol, inbound_format, model)
+                    except GatewayRetry as error:
+                        cooldown_account(aid)
+                        last_error = str(error)
+                        continue
+                    return
+
+                status, resp, err = gateway_send_upstream(
+                    base_url, upstream_path, upstream_key, upstream_bytes,
+                    protocol=upstream_protocol,
+                )
+                if resp is None:
+                    last_error = err or "upstream connection failed"
+                    cooldown_account(aid, 30)
+                    continue
+
+                try:
+                    resp_body = resp.read()
+                except (OSError, HTTPException):
+                    cooldown_account(aid, 30)
+                    last_error = "upstream response interrupted"
+                    continue
+                finally:
+                    resp.close()
+                resp_text = resp_body.decode("utf-8", errors="replace")
+
+                if status != 200:
+                    if is_quota_exhausted(status, resp_text):
+                        cooldown_account(aid)
+                        last_error = "account %s quota exhausted (HTTP %d)" % (aid, status)
+                        continue
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(resp_body)))
+                    self.end_headers()
+                    self.wfile.write(resp_body)
+                    return
+
+                record_gateway_request(aid)
+
+                # ---- Response conversion: upstream -> inbound protocol ----
+                try:
+                    upstream_json = json.loads(resp_text)
+                except json.JSONDecodeError:
+                    upstream_json = None
+                if not isinstance(upstream_json, dict) or upstream_json.get("error"):
+                    self._gateway_write_json(502, {"error": {"message": "upstream returned an invalid model response"}})
+                    return
+
+                out_model = model or upstream_body.get("model", "")
+                if upstream_protocol == inbound_format:
+                    out_bytes = resp_body
+                elif upstream_protocol == "openai" and inbound_format == "anthropic":
+                    out = openai_to_anthropic(upstream_json, out_model) if isinstance(upstream_json, dict) else None
+                    out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
+                elif upstream_protocol == "openai" and inbound_format == "responses":
+                    out = openai_to_responses(upstream_json, out_model) if isinstance(upstream_json, dict) else None
+                    out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
+                elif upstream_protocol == "anthropic" and inbound_format == "openai":
+                    out = anthropic_response_to_openai(upstream_json, out_model) if isinstance(upstream_json, dict) else None
+                    out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
+                elif upstream_protocol == "anthropic" and inbound_format == "responses":
+                    if isinstance(upstream_json, dict):
+                        oa = anthropic_response_to_openai(upstream_json, out_model)
+                        out = openai_to_responses(oa, out_model)
+                        out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8")
+                    else:
+                        out_bytes = resp_body
+                elif upstream_protocol == "anthropic" and inbound_format == "anthropic":
+                    out_bytes = resp_body
+                else:
+                    out_bytes = resp_body
+
+                if stream:
+                    out_bytes = gateway_message_events(json.loads(out_bytes), inbound_format)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8" if stream else "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(out_bytes)))
+                self.end_headers()
+                self.wfile.write(out_bytes)
+                return
+
+        self.send_error(503, "all gateway accounts exhausted: " + last_error)
+
+    def _gateway_diagnostics(self, accounts):
+        """Count why accounts are not eligible for gateway routing."""
+        total = 0
+        no_gateway = 0
+        disabled = 0
+        no_key = 0
+        for acc in accounts.values():
+            if not isinstance(acc, dict):
+                continue
+            total += 1
+            gw = acc.get("gateway") or {}
+            if gw.get("enabled") is False:
+                disabled += 1
+                continue
+            if not str(acc.get("apiKey", "")).strip():
+                no_key += 1
+                continue
+        return {
+            "total": total, "noGateway": no_gateway, "disabled": disabled,
+            "noApiKey": no_key,
+        }
+
+    def handle_gateway_models(self):
+        config = load_gateway_config()
+        if not config.get("enabled"):
+            self.send_error(503, "gateway disabled")
+            return
+        if not self._gateway_authenticate(config):
+            self.send_error(401, "invalid gateway api key")
+            return
+        accounts = load_requests(self.requests_path)
+        snapshot = load_snapshot(self.snapshot_path)
+        aid, acc = select_gateway_account(accounts, snapshot)
+        if not aid:
+            d = self._gateway_diagnostics(accounts)
+            msg = "no available gateway accounts (total %d, disabled %d, missing apiKey %d)" % (
+                d["total"], d["disabled"], d["noApiKey"]
+            )
+            self.send_error(503, msg)
+            return
+        gw = acc.get("gateway") or {}
+        category = gateway_category_for_account(acc)
+        upstream = config.get("upstreams", {}).get(category, {})
+        base_url = str(upstream.get("openaiBaseUrl", "")).strip()
+        if not base_url:
+            self.send_error(503, "upstream %s openaiBaseUrl not configured" % category)
+            return
+        status, resp, err = gateway_send_upstream(
+            base_url, "/models", str(acc.get("apiKey", "")).strip(), b"{}"
+        )
+        if resp is not None and status == 200:
+            body = resp.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # Upstream does not support /models (e.g. Volcengine plan endpoints);
+        # return a static list based on configured default model.
+        default_model = str(config.get("defaultModel", "")).strip()
+        models = []
+        if default_model:
+            models.append({"id": default_model, "object": "model", "created": 0, "owned_by": "gateway"})
+        static = {"object": "list", "data": models}
+        body = json.dumps(static, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_gateway_config_get(self):
+        config = load_gateway_config()
+        reveal = "reveal=1" in self.path or "reveal=true" in self.path
+        masked = dict(config)
+        if masked.get("apiKey"):
+            if not reveal:
+                masked["apiKey"] = mask_secret(masked["apiKey"])
+            masked["hasApiKey"] = True
+        self.send_json(masked)
+
+    def handle_gateway_config_post(self, payload):
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        config = load_gateway_config()
+        for key in ("enabled", "apiKey", "defaultModel", "maxRetries"):
+            if key in payload:
+                config[key] = payload[key]
+        if isinstance(payload.get("upstreams"), dict):
+            for cat in ("agentPlan", "codingPlan"):
+                if cat in payload["upstreams"] and isinstance(payload["upstreams"][cat], dict):
+                    config.setdefault("upstreams", {}).setdefault(cat, {}).update(
+                        payload["upstreams"][cat]
+                    )
+        save_gateway_config(config)
+        self.send_json({"ok": True})
+
+    def handle_gateway_status(self):
+        config = load_gateway_config()
+        accounts = load_requests(self.requests_path)
+        snapshot = gateway_routing_snapshot(load_snapshot(self.snapshot_path))
+        active_counts = {}
+        for entry in gateway_active_snapshot()["activeRequests"]:
+            aid = entry["accountId"]
+            active_counts[aid] = active_counts.get(aid, 0) + 1
+        now = time.time()
+        account_status = []
+        for aid, acc in accounts.items():
+            if not isinstance(acc, dict):
+                continue
+            gw = acc.get("gateway") or {}
+            remaining = account_remaining_percent(aid, snapshot)
+            cooling_until = _gateway_cooldowns.get(aid, 0)
+            enabled = gw.get("enabled") is not False and bool(acc.get("apiKey"))
+            concurrency_limit = gateway_concurrency_limit(acc)
+            active_count = active_counts.get(aid, 0)
+            weight = (remaining / 100.0) * max(0, concurrency_limit - active_count) if enabled and now >= cooling_until else 0
+            account_status.append({
+                "id": aid,
+                "label": acc.get("label", ""),
+                "source": acc.get("source", ""),
+                "gatewayEnabled": enabled,
+                "category": gateway_category_for_account(acc),
+                "remainingPercent": round(remaining, 1),
+                "weight": round(weight, 4),
+                "maxConcurrency": concurrency_limit,
+                "activeRequests": active_count,
+                "cooling": now < cooling_until,
+                "cooldownRemaining": max(0, int(cooling_until - now)) if now < cooling_until else 0,
+                "requests": _gateway_stats.get("by_account", {}).get(aid, 0),
+            })
+        self.send_json({
+            "enabled": bool(config.get("enabled")),
+            "totalRequests": _gateway_stats.get("total_requests", 0),
+            "accounts": account_status,
+        })
+
+
     def send_json(self, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
@@ -675,4 +1801,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     os.chdir(os.environ.get("APP_DIR", "/srv"))
     server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "80"))), DashboardHandler)
-    server.serve_forever()
+    quota_stop = Event()
+    Thread(target=gateway_quota_worker, args=(DashboardHandler.requests_path, quota_stop), daemon=True).start()
+    try:
+        server.serve_forever()
+    finally:
+        quota_stop.set()
+        server.server_close()

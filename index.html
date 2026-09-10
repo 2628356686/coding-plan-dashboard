@@ -43,10 +43,11 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
 .guide-note code{background:#0b1325;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:11px}
 </style>
 <style>.refresh-alert{margin:0 0 18px;padding:12px 14px;border:1px solid #9a4b5d;background:#351d2a;color:#ffd7df;border-radius:12px;font-size:13px}.refresh-alert strong{color:#ff8da1}.card.stale{filter:grayscale(.72);opacity:.68;border-color:#586276;background:linear-gradient(145deg,#202632e8,#151922e8)}.card.stale .logo,.card.stale .fill{filter:grayscale(.8)}.stale-note{margin-top:12px;color:#ffbdc8;font-size:12px}
-.app-layout{display:flex;min-height:100vh}
-.sidebar{width:210px;background:#0a1226ee;border-right:1px solid var(--line);padding:20px 0;flex-shrink:0;position:sticky;top:0;height:100vh;overflow-y:auto}
-.sidebar .brand{padding:0 20px 18px;border-bottom:1px solid var(--line);margin-bottom:10px}
-.sidebar .brand .logo-mark{width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,#6f8dff,#896df5);display:grid;place-items:center;font-weight:800;font-size:16px;color:#fff;margin-bottom:10px}
+:root{--app-header-height:80px}
+.app-layout{display:flex;height:100vh;height:100dvh;overflow:hidden}
+.sidebar{width:210px;background:#0a1226ee;border-right:1px solid var(--line);padding:0;flex-shrink:0;height:100%;overflow-y:auto}
+.sidebar .brand{height:var(--app-header-height);padding:0 20px;border-bottom:1px solid var(--line);margin:0 0 10px;position:sticky;top:0;background:#0a1226;z-index:20}
+.sidebar .brand .logo-mark{width:40px;height:40px;flex-shrink:0;border-radius:12px;background:linear-gradient(135deg,#6f8dff,#896df5);display:grid;place-items:center;font-weight:800;font-size:16px;color:#fff}
 .sidebar .brand h1{font-size:15px;margin:0;color:var(--text)}
 .sidebar .brand p{font-size:11px;color:var(--muted);margin:3px 0 0}
 .sidebar nav{margin-top:8px}
@@ -54,7 +55,18 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
 .sidebar nav a:hover{color:var(--text);background:#ffffff08}
 .sidebar nav a.active{color:var(--text);background:#ffffff0d;border-left-color:#7c9cff}
 .sidebar nav a .icon{font-size:16px;width:20px;text-align:center}
-.main-content{flex:1;overflow-y:auto;min-width:0}
+.main-content{flex:1;overflow-y:auto;min-width:0;scroll-padding-top:calc(var(--app-header-height) + 16px)}
+.app-header{height:var(--app-header-height);position:sticky;top:0;z-index:100;border-bottom:1px solid var(--line);background:#0f1931f2;backdrop-filter:blur(16px)}
+.app-header-inner{height:100%;max-width:1220px;margin:0 auto;padding:0 22px;display:flex;align-items:center;justify-content:space-between;gap:20px}
+.app-header-title{min-width:0}
+.app-header h1{font-size:22px;line-height:1.3;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.app-header p{margin:5px 0 0;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.app-header .actions{flex-shrink:0;flex-wrap:nowrap;margin:0;gap:8px}
+.app-header .btn{white-space:nowrap}
+.app-header .compact-label{display:none}
+.main-content>.shell{padding-top:24px}
+@media(max-width:1000px){:root{--app-header-height:112px}.app-header-inner{flex-direction:column;align-items:stretch;justify-content:center;gap:10px}.app-header .actions{justify-content:flex-start}.app-header p{display:none}.app-header h1{font-size:20px}}
+@media(max-width:640px){.sidebar{width:150px}.sidebar .brand{padding:0 12px;gap:8px}.sidebar .brand .logo-mark{width:30px;height:30px;font-size:13px}.sidebar .brand h1{font-size:12px}.sidebar nav a{padding:10px 12px}.app-header-inner{padding:0 12px}.app-header h1{font-size:16px}.app-header .btn{padding:8px 9px;font-size:12px}.app-header .full-label{display:none}.app-header .compact-label{display:inline}.main-content>.shell{padding-left:12px;padding-right:12px}}
 .page{display:none}.page.active{display:block}
 .page-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
 .page-header h2{font-size:22px;margin:0}
@@ -67,6 +79,12 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
 .accounts-table .platform{display:flex;align-items:center;gap:10px}
 .accounts-table .platform .logo{width:30px;height:30px;border-radius:9px;font-size:13px}
 .accounts-table .platform .name{font-weight:600}
+.gateway-switch{display:inline-flex;align-items:center;gap:8px;border:0;background:none;color:var(--text);cursor:pointer;white-space:nowrap;padding:4px}
+.gateway-switch-track{width:34px;height:20px;border-radius:12px;background:#46516a;position:relative;transition:background .15s}
+.gateway-switch-track::after{content:'';position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:white;transition:transform .15s}
+.gateway-switch[aria-checked="true"] .gateway-switch-track{background:var(--good)}
+.gateway-switch[aria-checked="true"] .gateway-switch-track::after{transform:translateX(14px)}
+.gateway-switch:disabled,body.locked .gateway-switch{opacity:.45;cursor:not-allowed}
 .empty-state{text-align:center;padding:60px 20px;color:var(--muted)}
 .empty-state .icon{font-size:48px;margin-bottom:12px;opacity:.5}
 .empty-state p{margin:4px 0}
@@ -88,8 +106,7 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
   <aside class="sidebar">
     <div class="brand">
       <div class="logo-mark">CP</div>
-      <h1>Coding Plan</h1>
-      <p>配额中心</p>
+      <div><h1>Coding Plan</h1><p>配额中心</p></div>
     </div>
     <nav>
       <a class="active" onclick="switchPage('dashboard',this)"><span class="icon">📊</span>仪表盘</a>
@@ -98,12 +115,18 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
     </nav>
   </aside>
   <div class="main-content">
+    <header class="app-header">
+      <div class="app-header-inner">
+        <div class="app-header-title"><h1>Coding Plan 配额中心</h1><p>统一查看各平台 Coding Plan 的限额、使用量和重置信息</p></div>
+        <div class="actions">
+          <button class="btn" id="lockToggle" title="锁定/解锁编辑" aria-label="锁定/解锁编辑" style="font-size:18px;padding:8px 12px">🔒</button>
+          <button class="btn primary" id="refreshAll" title="刷新可用数据"><span class="full-label">刷新可用数据</span><span class="compact-label">刷新</span></button>
+          <button class="btn ghost" id="clearData" title="清除本地数据"><span class="full-label">清除本地数据</span><span class="compact-label">清除</span></button>
+        </div>
+      </div>
+    </header>
     <main class="shell">
       <section id="page-dashboard" class="page active">
-  <section class="hero">
-    <div><div class="app-mark" aria-label="Coding Plan Dashboard icon"><svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="brandGradient" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#7c9cff"/><stop offset="1" stop-color="#b678ff"/></linearGradient></defs><path d="M12 39c10-19 22-19 40-10M12 49c12-16 23-16 40-7" fill="none" stroke="url(#brandGradient)" stroke-width="5" stroke-linecap="round"/><circle cx="12" cy="39" r="4" fill="#35d399"/><circle cx="52" cy="29" r="4" fill="#ffbd66"/></svg></div><div class="eyebrow">Local quota console</div><h1>Coding Plan 配额中心</h1><p>统一查看各平台 Coding Plan 的限额、使用量、重置信息和数据更新时间。支持同一平台多账号。</p></div>
-    <div class="actions"><button class="btn" id="lockToggle" title="锁定/解锁编辑" style="font-size:18px;padding:8px 12px">🔒</button><button class="btn primary" id="refreshAll">刷新可用数据</button><button class="btn ghost" id="clearData">清除本地数据</button></div>
-  </section>
   <section class="summary" id="summary"></section>
   <section class="refresh-alert hidden" id="refreshAlert" role="alert"></section>
   <section class="grid" id="cards"></section>
@@ -148,12 +171,38 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
       </section>
       <section id="page-gateway" class="page">
         <div class="page-header">
-          <div><h2>网关管理</h2><p>功能开发中，敬请期待</p></div>
+          <div><h2>网关管理</h2><p>配置 API 网关，按账号剩余额度加权路由，对外统一提供 OpenAI / Anthropic / Responses 兼容接口</p></div>
+          <button class="btn primary" id="gwSaveBtn" onclick="gwSaveConfig()">保存网关配置</button>
         </div>
-        <div class="empty-state">
-          <div class="icon">🌐</div>
-          <p>网关管理功能即将上线</p>
-          <p style="font-size:12px;opacity:.7">后续将支持 API 网关配置、路由管理、流量控制等功能</p>
+        <div class="panel" style="margin-bottom:18px">
+          <h3>当前并发 <span class="badge" id="gwActiveCount">—</span></h3>
+          <p class="hint" id="gwActiveHint" aria-live="polite">每秒自动更新，显示正在处理请求的账号和模型</p>
+          <div class="accounts-table-wrap">
+            <table class="accounts-table">
+              <thead><tr><th>账号</th><th>模型</th><th>接口协议</th><th>输出方式</th><th>已持续</th></tr></thead>
+              <tbody id="gwActiveTbody"><tr><td colspan="5" style="text-align:center;color:var(--muted)">加载中…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="panel" style="margin-bottom:18px">
+          <h3>网关设置</h3>
+          <p class="hint">启用后，网关端点 <code>/v1/chat/completions</code>、<code>/v1/messages</code>、<code>/v1/responses</code> 将对外提供服务，调用方需在 Header 中携带 <code>Authorization: Bearer &lt;网关Key&gt;</code></p>
+          <div class="source-body">
+            <div class="field"><label>启用网关</label><select id="gwEnabled"><option value="true">启用</option><option value="false">停用</option></select></div>
+            <div class="field"><label>网关 API Key（对外认证）</label><div style="display:flex;gap:8px"><input id="gwApiKey" type="password" placeholder="sk-gateway-xxx" autocomplete="off" style="flex:1"><button type="button" class="btn" style="padding:8px 12px;white-space:nowrap" onclick="gwToggleKey()" id="gwKeyToggleBtn">显示</button><button type="button" class="btn" style="padding:8px 12px;white-space:nowrap" onclick="gwCopyKey()">复制</button><button type="button" class="btn" style="padding:8px 12px;white-space:nowrap" onclick="gwGenerateKey()">生成</button></div></div>
+            <div class="field"><label>默认模型</label><input id="gwDefaultModel" type="text" placeholder="如 doubao-1-5-pro-32k"></div>
+            <div class="field"><label>最大重试次数</label><input id="gwMaxRetries" type="number" min="1" max="10" value="3"></div>
+          </div>
+        </div>
+        <div class="panel" style="margin-bottom:18px">
+          <h3>上游地址配置</h3>
+          <p class="hint">方舟 Agent Plan 和 Coding Plan 各自提供 Anthropic 兼容和 OpenAI 兼容两套地址。网关根据入站协议自动选择对应地址，账号只需选择所属套餐</p>
+          <div class="source-body">
+            <div class="field"><label>Agent Plan · Anthropic 地址</label><input id="gwAgentAnthropicUrl" type="text" placeholder="https://ark.cn-beijing.volces.com/api/plan"></div>
+            <div class="field"><label>Agent Plan · OpenAI 地址</label><input id="gwAgentOpenaiUrl" type="text" placeholder="https://ark.cn-beijing.volces.com/api/plan/v3"></div>
+            <div class="field"><label>Coding Plan · Anthropic 地址</label><input id="gwCodingAnthropicUrl" type="text" placeholder="https://ark.cn-beijing.volces.com/api/coding"></div>
+            <div class="field"><label>Coding Plan · OpenAI 地址</label><input id="gwCodingOpenaiUrl" type="text" placeholder="https://ark.cn-beijing.volces.com/api/coding/v3"></div>
+          </div>
         </div>
       </section>
     </main>
@@ -303,6 +352,8 @@ function switchPage(pageId, el){
   if(page) page.classList.add('active');
   if(el) el.classList.add('active');
   if(pageId==='accounts') renderAccountsTable();
+  gwStopActivePolling();
+  if(pageId==='gateway'){gwLoadConfig();gwPollActive();}
 }
 function copyText(text, btn){
   if(!text) return;
@@ -312,6 +363,22 @@ function copyText(text, btn){
   }else{
     const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);done();
   }
+}
+const gatewayTogglePending=new Set();
+async function toggleAccountGateway(id){
+  if(locked){lockedAlert();return;}
+  const acc=requestDefinitions[id];
+  if(!acc||gatewayTogglePending.has(id)) return;
+  const enabled=acc.gateway?.enabled===false;
+  gatewayTogglePending.add(id);
+  renderAccountsTable();
+  try{
+    const response=await fetch('/api/requests/gateway',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,enabled})});
+    if(!response.ok) throw new Error('HTTP '+response.status);
+    const result=await response.json();
+    if(requestDefinitions[id]) requestDefinitions[id].gateway=result.gateway;
+  }catch(e){alert('网关开关保存失败：'+e.message);}
+  finally{gatewayTogglePending.delete(id);renderAccountsTable();}
 }
 function renderAccountsTable(){
   const container=document.getElementById('accountsTableContainer');
@@ -334,9 +401,11 @@ function renderAccountsTable(){
     const accountId=acc.accountId?escapeHtml(acc.accountId)+_cb(acc.accountId):dash;
     const apiKey=acc.apiKey?escapeHtml(acc.apiKey)+_cb(acc.apiKey):dash;
     const sourceName=src.name+(src.sub?' '+src.sub:'');
-    return `<tr><td><div class="platform"><div class="logo ${src.className}">${src.logo}</div><div class="name">${escapeHtml(sourceName)}</div></div></td><td>${label}</td><td>${phone}</td><td>${username}</td><td>${password}</td><td>${accountId}</td><td>${apiKey}</td><td>${cookieStr}</td><td style="color:var(--muted)">${updatedAt}</td><td><button class="btn" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="editAccountFromTable('${id}')">编辑</button><button class="btn danger" style="padding:4px 10px;font-size:12px" onclick="deleteAccount('${id}')">删除</button></td></tr>`;
+    const enabled=acc.gateway?.enabled!==false;
+    const gatewaySwitch=`<button type="button" class="gateway-switch" role="switch" aria-checked="${enabled}" aria-label="网关转发" ${gatewayTogglePending.has(id)?'disabled':''} data-account-id="${escapeHtml(id)}" onclick="toggleAccountGateway(this.dataset.accountId)"><span class="gateway-switch-track" aria-hidden="true"></span><span>${enabled?'开启':'关闭'}</span></button>`;
+    return `<tr><td><div class="platform"><div class="logo ${src.className}">${src.logo}</div><div class="name">${escapeHtml(sourceName)}</div></div></td><td>${label}</td><td>${phone}</td><td>${username}</td><td>${password}</td><td>${accountId}</td><td>${apiKey}</td><td>${cookieStr}</td><td style="color:var(--muted)">${updatedAt}</td><td>${gatewaySwitch}</td><td><button class="btn" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="editAccountFromTable('${id}')">编辑</button><button class="btn danger" style="padding:4px 10px;font-size:12px" onclick="deleteAccount('${id}')">删除</button></td></tr>`;
   }).join('');
-  container.innerHTML=`<div class="accounts-table-wrap"><table class="accounts-table"><thead><tr><th>平台</th><th>备注</th><th>手机号</th><th>用户名</th><th>密码</th><th>AccountID</th><th>API Key</th><th>登录态有效期</th><th>数据更新时间</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  container.innerHTML=`<div class="accounts-table-wrap"><table class="accounts-table"><thead><tr><th>平台</th><th>备注</th><th>手机号</th><th>用户名</th><th>密码</th><th>AccountID</th><th>API Key</th><th>登录态有效期</th><th>数据更新时间</th><th>网关启用</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 let editingAccountId=null;
 function editAccountFromTable(id){
@@ -350,6 +419,7 @@ function editAccountFromTable(id){
   document.getElementById('editPassword').value=acc.password||'';
   document.getElementById('editAccountId').value=acc.accountId||'';
   document.getElementById('editApiKey').value=acc.apiKey||'';
+  document.getElementById('editMaxConcurrency').value=acc.gateway?.maxConcurrency||1;
   document.getElementById('editAccountModal').classList.remove('hidden');
 }
 function closeEditModal(){
@@ -366,16 +436,151 @@ async function saveEditModal(){
   const password=document.getElementById('editPassword').value.trim();
   const accountId=document.getElementById('editAccountId').value.trim();
   const apiKey=document.getElementById('editApiKey').value.trim();
+  const gateway={...(acc.gateway||{}),maxConcurrency:Number(document.getElementById('editMaxConcurrency').value)};
   try{
-    const body={id:editingAccountId,label,curl:acc.curl,updatedAt:now(),phone,username,password,accountId,apiKey};
+    const body={id:editingAccountId,label,curl:acc.curl,updatedAt:now(),phone,username,password,accountId,apiKey,gateway};
     if(acc.source==='googleAi'){body.source='googleAi';body.refreshToken=acc.refreshToken||'';body.proxy=acc.proxy||'';}
     const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!response.ok){let msg='保存失败';try{const e=await response.json();if(e.error)msg=e.error}catch(_){}throw new Error(msg);}
-    requestDefinitions[editingAccountId]={...acc,label,phone,username,password,accountId,apiKey};
+    requestDefinitions[editingAccountId]={...acc,label,phone,username,password,accountId,apiKey,gateway};
     closeEditModal();
     render();
   }catch(error){alert('保存失败：'+error.message);}
 }
+
+// ---- Gateway management ----
+let gwActiveTimer=null;
+let gwActiveController=null;
+function gwStopActivePolling(){
+  clearTimeout(gwActiveTimer);
+  gwActiveTimer=null;
+  if(gwActiveController) gwActiveController.abort();
+  gwActiveController=null;
+}
+async function gwPollActive(){
+  if(document.hidden||!document.getElementById('page-gateway').classList.contains('active')) return;
+  const controller=new AbortController();
+  gwActiveController=controller;
+  const timeout=setTimeout(()=>controller.abort(),5000);
+  try{
+    const r=await fetch('/api/gateway/active',{cache:'no-store',signal:controller.signal});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const status=await r.json();
+    if(gwActiveController!==controller) return;
+    const requests=status.activeRequests||[];
+    document.getElementById('gwActiveCount').textContent=status.activeCount+' 个请求';
+    document.getElementById('gwActiveHint').textContent='每秒自动更新 · 同一账号的多个请求分别显示';
+    const protocols={openai:'OpenAI Chat',anthropic:'Anthropic Messages',responses:'Responses'};
+    document.getElementById('gwActiveTbody').innerHTML=requests.length?requests.map(item=>{
+      const seconds=Math.floor(Number(item.elapsedSeconds)||0);
+      const duration=seconds<60?seconds+' 秒':Math.floor(seconds/60)+' 分 '+seconds%60+' 秒';
+      return `<tr><td><strong>${escapeHtml(item.accountLabel||item.accountId)}</strong></td><td>${escapeHtml(item.model||'未指定模型')}</td><td>${escapeHtml(protocols[item.protocol]||item.protocol||'—')}</td><td>${item.stream?'流式':'非流式'}</td><td>${duration}</td></tr>`;
+    }).join(''):'<tr><td colspan="5" style="text-align:center;color:var(--muted)">当前没有正在处理的请求</td></tr>';
+  }catch(e){
+    if(gwActiveController!==controller) return;
+    document.getElementById('gwActiveCount').textContent='—';
+    document.getElementById('gwActiveHint').textContent='状态更新失败，正在自动重试';
+    document.getElementById('gwActiveTbody').innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--muted)">暂时无法获取当前并发</td></tr>';
+  }finally{
+    clearTimeout(timeout);
+    if(gwActiveController===controller){
+      gwActiveController=null;
+      gwActiveTimer=setTimeout(gwPollActive,1000);
+    }
+  }
+}
+document.addEventListener('visibilitychange',()=>{gwStopActivePolling();if(!document.hidden) gwPollActive();});
+
+async function gwLoadConfig(){
+  _gwKeyRevealed=false;
+  document.getElementById('gwKeyToggleBtn').textContent='显示';
+  document.getElementById('gwApiKey').type='password';
+  try{
+    const r=await fetch('/api/gateway/config');
+    if(!r.ok) return;
+    const c=await r.json();
+    document.getElementById('gwEnabled').value=String(c.enabled!==false);
+    document.getElementById('gwApiKey').value=c.hasApiKey?'****':(c.apiKey||'');
+    document.getElementById('gwDefaultModel').value=c.defaultModel||'';
+    document.getElementById('gwMaxRetries').value=c.maxRetries||3;
+    const up=c.upstreams||{};
+    document.getElementById('gwAgentAnthropicUrl').value=(up.agentPlan&&up.agentPlan.anthropicBaseUrl)||'';
+    document.getElementById('gwAgentOpenaiUrl').value=(up.agentPlan&&up.agentPlan.openaiBaseUrl)||'';
+    document.getElementById('gwCodingAnthropicUrl').value=(up.codingPlan&&up.codingPlan.anthropicBaseUrl)||'';
+    document.getElementById('gwCodingOpenaiUrl').value=(up.codingPlan&&up.codingPlan.openaiBaseUrl)||'';
+  }catch(e){console.error('gw load config failed',e);}
+}
+let _gwKeyRevealed=false;
+async function gwToggleKey(){
+  const input=document.getElementById('gwApiKey');
+  const btn=document.getElementById('gwKeyToggleBtn');
+  if(_gwKeyRevealed){
+    input.type='password';
+    btn.textContent='显示';
+    _gwKeyRevealed=false;
+    gwLoadConfig();
+    return;
+  }
+  try{
+    const r=await fetch('/api/gateway/config?reveal=1');
+    if(!r.ok) return;
+    const c=await r.json();
+    if(c.apiKey&&!c.apiKey.startsWith('****')){
+      input.value=c.apiKey;
+      input.type='text';
+      btn.textContent='隐藏';
+      _gwKeyRevealed=true;
+    }
+  }catch(e){console.error('reveal key failed',e);}
+}
+function gwCopyKey(){
+  const input=document.getElementById('gwApiKey');
+  const val=input.value;
+  if(!val||val.startsWith('****')){alert('请先点击「显示」查看完整密钥');return;}
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(val).then(()=>{const btn=event.target;const o=btn.textContent;btn.textContent='已复制';setTimeout(()=>btn.textContent=o,1500);});
+  }else{
+    input.select();document.execCommand('copy');
+  }
+}
+function gwGenerateKey(){
+  const chars='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let key='sk-gw-';
+  if(window.crypto&&crypto.getRandomValues){
+    const arr=new Uint8Array(32);
+    crypto.getRandomValues(arr);
+    for(let i=0;i<arr.length;i++) key+=chars[arr[i]%chars.length];
+  }else{
+    for(let i=0;i<32;i++) key+=chars[Math.floor(Math.random()*chars.length)];
+  }
+  document.getElementById('gwApiKey').value=key;
+}
+async function gwSaveConfig(){
+  const apiKeyRaw=document.getElementById('gwApiKey').value.trim();
+  const payload={
+    enabled:document.getElementById('gwEnabled').value==='true',
+    defaultModel:document.getElementById('gwDefaultModel').value.trim(),
+    maxRetries:parseInt(document.getElementById('gwMaxRetries').value)||3,
+    upstreams:{
+      agentPlan:{
+        anthropicBaseUrl:document.getElementById('gwAgentAnthropicUrl').value.trim(),
+        openaiBaseUrl:document.getElementById('gwAgentOpenaiUrl').value.trim(),
+      },
+      codingPlan:{
+        anthropicBaseUrl:document.getElementById('gwCodingAnthropicUrl').value.trim(),
+        openaiBaseUrl:document.getElementById('gwCodingOpenaiUrl').value.trim(),
+      },
+    },
+  };
+  if(apiKeyRaw&&!apiKeyRaw.startsWith('****')) payload.apiKey=apiKeyRaw;
+  try{
+    const r=await fetch('/api/gateway/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    if(!r.ok){let m='保存失败';try{const e=await r.json();if(e.error)m=e.error}catch(_){}throw new Error(m);}
+    alert('网关配置已保存');
+    gwLoadConfig();
+  }catch(e){alert('保存失败：'+e.message);}
+}
+
 </script>
 
 <div id="editAccountModal" class="modal hidden">
@@ -387,6 +592,7 @@ async function saveEditModal(){
     <div class="field"><label>密码</label><input id="editPassword" type="password" placeholder="选填，明文保存在本地"></div>
     <div class="field"><label>AccountID</label><input id="editAccountId" type="text" placeholder="选填"></div>
     <div class="field"><label>API Key</label><input id="editApiKey" type="password" placeholder="选填，明文保存在本地"></div>
+    <div class="field"><label for="editMaxConcurrency">网关并发上限</label><select id="editMaxConcurrency"><option value="1">1（默认）</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option></select><p class="hint">每个账号可同时处理的请求数。达到上限后，新请求会分配给其他可用账号。</p></div>
     <div class="actions">
       <button class="btn" onclick="closeEditModal()">取消</button>
       <button class="btn primary" onclick="saveEditModal()">保存</button>
