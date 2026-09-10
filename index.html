@@ -20,7 +20,7 @@
 .label-edit button.save{background:linear-gradient(135deg,#6f8dff,#896df5);border-color:transparent}
 .creds-edit{display:grid;gap:8px;margin-top:10px;padding:10px;background:#0d1528aa;border-radius:10px;border:1px solid #ffffff0b}
 .creds-edit input{padding:5px 8px;font-size:13px;background:#0b1325;border:1px solid var(--line);border-radius:7px;color:var(--text)}
-body.locked .card-actions,body.locked .reorder-btns,body.locked #clearData,body.locked #addGoogleAccount,body.locked #saveCurl,body.locked #fetchCurrent,body.locked #importPayload{display:none!important}
+body.locked .card-actions button,body.locked .reorder-btns button,body.locked #clearData,body.locked #addGoogleAccount,body.locked #saveCurl,body.locked #fetchCurrent,body.locked #importPayload{opacity:.4!important;cursor:not-allowed!important;filter:grayscale(.5)}
 .reorder-btns{display:flex;gap:4px;margin-top:8px}
 .reorder-btns button{padding:4px 8px;font-size:14px;border-radius:7px;border:1px solid var(--line);background:#182544;color:var(--muted);cursor:pointer}
 .reorder-btns button:hover{color:var(--text);border-color:#607dd2}
@@ -78,6 +78,9 @@ body.locked .card-actions,body.locked .reorder-btns,body.locked #clearData,body.
 .modal-content .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
 .modal-content .actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}
 .accounts-table-wrap{overflow-x:auto}
+.copy-btn{background:none;border:none;cursor:pointer;color:var(--muted);font-size:12px;padding:2px 5px;margin-left:4px;border-radius:5px;opacity:.6;transition:all .15s}
+.copy-btn:hover{color:var(--text);background:#ffffff12;opacity:1}
+.copy-btn.copied{color:var(--good);opacity:1}
 </style>
 </head>
 <body>
@@ -272,17 +275,23 @@ function render(){
 async function loadRequests(){try{const [accRes,orderRes]=await Promise.all([fetch('/api/requests'),fetch('/api/order')]);if(accRes.ok){const data=await accRes.json();requestDefinitions=data||{}}if(orderRes.ok){const data=await orderRes.json();const ids=Object.keys(requestDefinitions);accountOrder=Array.isArray(data.order)?data.order.filter(id=>ids.includes(id)):[]}else{accountOrder=[]}}catch{requestDefinitions={};accountOrder=[]}}
 async function loadCachedResults(){try{const response=await fetch('/api/results');if(!response.ok)return;const results=await response.json();for(const [id,result] of Object.entries(results)){if(!result?.ok||!result.body)continue;try{const acc=requestDefinitions[id];if(!acc)continue;const payload=JSON.parse(result.body),part=parseForAccount(acc.source,payload),updatedAt=result.updatedAt||part.updatedAt;part.updatedAt=updatedAt;state[id]=part}catch(error){console.error(`failed to parse cached ${id}`,error)}}mergeCodexNewApiCredits()}catch(error){console.error('cached quota results unavailable',error)}}
 async function refreshFromServer(){try{const response=await fetch('/api/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!response.ok){refreshErrors.__request={status:response.status};render();throw new Error(`HTTP ${response.status}`)}delete refreshErrors.__request;const results=await response.json();for(const [id,result] of Object.entries(results)){const acc=requestDefinitions[id];if(!acc)continue;if(!result.ok||result.status!==200){refreshErrors[id]={status:result.status,error:result.error};continue}delete refreshErrors[id];try{const payload=JSON.parse(result.body),part=parseForAccount(acc.source,payload),updatedAt=result.updatedAt||now();part.updatedAt=updatedAt;state[id]=part}catch(error){refreshErrors[id]={status:result.status,error:error.message};console.error(`failed to parse ${id}`,error)}}mergeCodexNewApiCredits();await save();render()}catch(error){console.error('quota refresh failed',error);render()}}
-async function saveCurl(){if(locked)return;const curl=$('#curlInput').value.trim();if(!curl){alert('请先粘贴原始 curl 请求');return}const label=$('#labelInput').value.trim();try{const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({curl,label,updatedAt:now()})});if(!response.ok){let msg=`HTTP ${response.status}`;try{const err=await response.json();if(err.error)msg=err.error}catch(e){}throw new Error(msg)}const result=await response.json();requestDefinitions[result.id]={source:result.source,label,curl,updatedAt:now()};$('#curlInput').value='';$('#labelInput').value='';await refreshFromServer()}catch(error){alert(`保存 curl 失败：${error.message}`)}}
-async function addGoogleAccount(){if(locked)return;const label=$('#googleLabel').value.trim();const refreshToken=$('#googleRefreshToken').value.trim();const proxy=$('#googleProxy').value.trim();if(!refreshToken){alert('请填写 OAuth Refresh Token');return}try{const body={source:'googleAi',label,refreshToken,updatedAt:now()};if(proxy)body.proxy=proxy;const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok)throw new Error(await response.text());const result=await response.json();requestDefinitions[result.id]={source:result.source,label,refreshToken:refreshToken.slice(0,4)+'****',hasCreds:true,curl:'',proxy,updatedAt:now()};$('#googleLabel').value='';$('#googleRefreshToken').value='';$('#googleProxy').value='';render();await refreshFromServer()}catch(error){alert(`创建 Google AI 账号失败：${error.message}`)}}
-async function saveLabel(id,label){if(locked)return;try{const acc=requestDefinitions[id];if(!acc)return;const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,label,curl:acc.curl,updatedAt:now()})});if(!response.ok)throw new Error(await response.text());requestDefinitions[id]={...acc,label};render()}catch(error){alert(`保存备注失败：${error.message}`)}}
-function editLabel(id){if(locked)return;const acc=requestDefinitions[id];if(!acc)return;const cards=document.querySelectorAll('#cards .card');for(const card of cards){const btn=card.querySelector('.card-actions button');if(btn&&btn.getAttribute('onclick')&&btn.getAttribute('onclick').includes(id)){const brandDiv=card.querySelector('.brand > div:last-child');if(brandDiv){const currentLabel=acc.label||'';brandDiv.insertAdjacentHTML('beforeend',`<div class="label-edit"><input type="text" value="${escapeHtml(currentLabel)}" placeholder="输入备注"><button class="save" onclick="saveLabel('${id}',this.previousElementSibling.value)">保存</button></div>`);brandDiv.querySelector('.label-edit input')?.focus()}break}}}
-async function deleteAccount(id){if(locked)return;const acc=requestDefinitions[id];if(!acc)return;const name=`${SOURCES[acc.source]?.name||acc.source}${acc.label?' · '+acc.label:''}`;if(!confirm(`确认删除账号「${name}」？\n\n删除后不可恢复，该账号的 curl 和缓存数据将被清除。`))return;try{const response=await fetch('/api/requests',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});if(!response.ok)throw new Error(await response.text());delete requestDefinitions[id];delete state[id];delete refreshErrors[id];render()}catch(error){alert(`删除失败：${error.message}`)}}
+async function saveCurl(){if(locked){lockedAlert();return;}const curl=$('#curlInput').value.trim();if(!curl){alert('请先粘贴原始 curl 请求');return}const label=$('#labelInput').value.trim();try{const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({curl,label,updatedAt:now()})});if(!response.ok){let msg=`HTTP ${response.status}`;try{const err=await response.json();if(err.error)msg=err.error}catch(e){}throw new Error(msg)}const result=await response.json();const _newAcc={source:result.source,label,curl,updatedAt:now()};
+    if(result.accountId) _newAcc.accountId=result.accountId;
+    if(result.cookieExpires) _newAcc.cookieExpires=result.cookieExpires;
+    requestDefinitions[result.id]=_newAcc;$('#curlInput').value='';$('#labelInput').value='';await refreshFromServer()}catch(error){alert(`保存 curl 失败：${error.message}`)}}
+async function addGoogleAccount(){if(locked){lockedAlert();return;}const label=$('#googleLabel').value.trim();const refreshToken=$('#googleRefreshToken').value.trim();const proxy=$('#googleProxy').value.trim();if(!refreshToken){alert('请填写 OAuth Refresh Token');return}try{const body={source:'googleAi',label,refreshToken,updatedAt:now()};if(proxy)body.proxy=proxy;const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok)throw new Error(await response.text());const result=await response.json();requestDefinitions[result.id]={source:result.source,label,refreshToken:refreshToken.slice(0,4)+'****',hasCreds:true,curl:'',proxy,updatedAt:now()};$('#googleLabel').value='';$('#googleRefreshToken').value='';$('#googleProxy').value='';render();await refreshFromServer()}catch(error){alert(`创建 Google AI 账号失败：${error.message}`)}}
+async function saveLabel(id,label){if(locked){lockedAlert();return;}try{const acc=requestDefinitions[id];if(!acc)return;const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,label,curl:acc.curl,updatedAt:now()})});if(!response.ok)throw new Error(await response.text());requestDefinitions[id]={...acc,label};render()}catch(error){alert(`保存备注失败：${error.message}`)}}
+function editLabel(id){if(locked){lockedAlert();return;}const acc=requestDefinitions[id];if(!acc)return;const cards=document.querySelectorAll('#cards .card');for(const card of cards){const btn=card.querySelector('.card-actions button');if(btn&&btn.getAttribute('onclick')&&btn.getAttribute('onclick').includes(id)){const brandDiv=card.querySelector('.brand > div:last-child');if(brandDiv){const currentLabel=acc.label||'';brandDiv.insertAdjacentHTML('beforeend',`<div class="label-edit"><input type="text" value="${escapeHtml(currentLabel)}" placeholder="输入备注"><button class="save" onclick="saveLabel('${id}',this.previousElementSibling.value)">保存</button></div>`);brandDiv.querySelector('.label-edit input')?.focus()}break}}}
+async function deleteAccount(id){if(locked){lockedAlert();return;}const acc=requestDefinitions[id];if(!acc)return;const name=`${SOURCES[acc.source]?.name||acc.source}${acc.label?' · '+acc.label:''}`;if(!confirm(`确认删除账号「${name}」？\n\n删除后不可恢复，该账号的 curl 和缓存数据将被清除。`))return;try{const response=await fetch('/api/requests',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});if(!response.ok)throw new Error(await response.text());delete requestDefinitions[id];delete state[id];delete refreshErrors[id];render()}catch(error){alert(`删除失败：${error.message}`)}}
 async function importCurrent(){alert('JSON 导入功能在多账号模式下暂不可用，请使用 curl 导入并刷新')}
-function editGoogleCreds(id){if(locked)return;const acc=requestDefinitions[id];if(!acc)return;const card=[...document.querySelectorAll('#cards .card')].find(c=>{const b=c.querySelector('.card-actions button');return b&&b.getAttribute('onclick')&&b.getAttribute('onclick').includes(id)});if(!card)return;let box=card.querySelector('.creds-edit');if(box){box.remove();return}box=document.createElement('div');box.className='creds-edit';box.innerHTML=`<input type="password" placeholder="OAuth Refresh Token（留空保持不变）"><input type="text" placeholder="代理（可选）" value="${escapeHtml(acc.proxy||'')}"><div class="actions"><button class="btn primary" onclick="saveGoogleCreds('${id}',this.parentElement.previousElementSibling.previousElementSibling.value,this.parentElement.previousElementSibling.value)">保存</button></div>`;card.querySelector('.period-list')?.after(box);box.querySelector('input')?.focus()}
-async function saveGoogleCreds(id,refreshToken,proxy){if(locked)return;try{const acc=requestDefinitions[id];if(!acc)return;const body={id,label:acc.label||'',curl:acc.curl,updatedAt:now()};if(refreshToken)body.refreshToken=refreshToken;if(proxy)body.proxy=proxy;const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok)throw new Error(await response.text());requestDefinitions[id]={...acc,hasCreds:true,proxy:proxy||acc.proxy};render();await refreshFromServer()}catch(error){alert(`保存 Token 失败：${error.message}`)}}
+function editGoogleCreds(id){if(locked){lockedAlert();return;}const acc=requestDefinitions[id];if(!acc)return;const card=[...document.querySelectorAll('#cards .card')].find(c=>{const b=c.querySelector('.card-actions button');return b&&b.getAttribute('onclick')&&b.getAttribute('onclick').includes(id)});if(!card)return;let box=card.querySelector('.creds-edit');if(box){box.remove();return}box=document.createElement('div');box.className='creds-edit';box.innerHTML=`<input type="password" placeholder="OAuth Refresh Token（留空保持不变）"><input type="text" placeholder="代理（可选）" value="${escapeHtml(acc.proxy||'')}"><div class="actions"><button class="btn primary" onclick="saveGoogleCreds('${id}',this.parentElement.previousElementSibling.previousElementSibling.value,this.parentElement.previousElementSibling.value)">保存</button></div>`;card.querySelector('.period-list')?.after(box);box.querySelector('input')?.focus()}
+async function saveGoogleCreds(id,refreshToken,proxy){if(locked){lockedAlert();return;}try{const acc=requestDefinitions[id];if(!acc)return;const body={id,label:acc.label||'',curl:acc.curl,updatedAt:now()};if(refreshToken)body.refreshToken=refreshToken;if(proxy)body.proxy=proxy;const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok)throw new Error(await response.text());requestDefinitions[id]={...acc,hasCreds:true,proxy:proxy||acc.proxy};render();await refreshFromServer()}catch(error){alert(`保存 Token 失败：${error.message}`)}}
+function lockedAlert(){
+  alert('当前已锁定，编辑功能已禁用。\n\n请点击右上角 🔒 解锁后再操作。');
+}
 function toggleLock(){locked=!locked;const btn=$('#lockToggle');if(locked){btn.textContent='🔒';btn.classList.remove('unlocked');btn.title='已锁定，点击解锁编辑';document.body.classList.add('locked')}else{btn.textContent='🔓';btn.classList.add('unlocked');btn.title='已解锁，可编辑备注/删除/排序';document.body.classList.remove('locked')}render()}
 function getOrderedAccounts(){const seen=new Set();const ordered=[];for(const id of accountOrder){if(requestDefinitions[id]&&!seen.has(id)){ordered.push([id,requestDefinitions[id]]);seen.add(id)}}for(const[id,acc] of Object.entries(requestDefinitions)){if(!seen.has(id)){ordered.push([id,acc]);seen.add(id)}}return ordered}
-function moveAccount(id,dir){if(locked)return;const ordered=getOrderedAccounts();const idx=ordered.findIndex(([aid])=>aid===id);if(idx<0)return;const target=idx+dir;if(target<0||target>=ordered.length)return;const tmp=ordered[idx];ordered[idx]=ordered[target];ordered[target]=tmp;accountOrder=ordered.map(([aid])=>aid);saveOrder();render()}
+function moveAccount(id,dir){if(locked){lockedAlert();return;}const ordered=getOrderedAccounts();const idx=ordered.findIndex(([aid])=>aid===id);if(idx<0)return;const target=idx+dir;if(target<0||target>=ordered.length)return;const tmp=ordered[idx];ordered[idx]=ordered[target];ordered[target]=tmp;accountOrder=ordered.map(([aid])=>aid);saveOrder();render()}
 async function saveOrder(){try{await fetch('/api/order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order:accountOrder})})}catch{}}
 $('#refreshAll').onclick=()=>refreshFromServer();$('#lockToggle').onclick=toggleLock;$('#saveCurl').onclick=saveCurl;$('#importPayload').onclick=importCurrent;$('#fetchCurrent').onclick=()=>refreshFromServer();$('#clearData').onclick=async()=>{if(locked){alert('请先解锁编辑（点击右上角 🔒 图标）');return}if(!confirm('确认清除所有本地缓存数据？\n\n服务器保存的账号配置和最后一次成功的查询结果不会被清除。'))return;localStorage.removeItem('coding-plan-quota-snapshot');Object.keys(state).forEach(key=>delete state[key]);await save();render()};$('#addGoogleAccount').onclick=addGoogleAccount;setInterval(updateWaits,1000);(async()=>{document.body.classList.add('locked');await load();render();await loadRequests();await loadCachedResults();render();await refreshFromServer();render()})();
 
@@ -294,6 +303,15 @@ function switchPage(pageId, el){
   if(page) page.classList.add('active');
   if(el) el.classList.add('active');
   if(pageId==='accounts') renderAccountsTable();
+}
+function copyText(text, btn){
+  if(!text) return;
+  const done=()=>{const orig=btn.textContent;btn.textContent='✓';btn.classList.add('copied');setTimeout(()=>{btn.textContent=orig;btn.classList.remove('copied')},1500)};
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done).catch(()=>{const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);done()});
+  }else{
+    const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);done();
+  }
 }
 function renderAccountsTable(){
   const container=document.getElementById('accountsTableContainer');
@@ -309,18 +327,20 @@ function renderAccountsTable(){
     const cookieStr=acc.cookieExpires?fmtCookieExpiry(acc.cookieExpires):dash;
     const updatedAt=state[id]&&state[id].updatedAt?fmtDate(state[id].updatedAt):'<span style="color:var(--muted)">未刷新</span>';
     const label=acc.label?escapeHtml(acc.label):dash;
-    const phone=acc.phone?escapeHtml(acc.phone):dash;
-    const username=acc.username?escapeHtml(acc.username):dash;
-    const password=acc.password?'••••••':dash;
-    const accountId=acc.accountId?escapeHtml(acc.accountId):dash;
+    const _cb=(t)=>t&&t!==dash?`<button class="copy-btn" onclick="copyText(this.dataset.v,this)" data-v="${t.replace(/"/g,'&quot;')}" title="复制">📋</button>`:'';
+    const phone=acc.phone?escapeHtml(acc.phone)+_cb(acc.phone):dash;
+    const username=acc.username?escapeHtml(acc.username)+_cb(acc.username):dash;
+    const password=acc.password?escapeHtml(acc.password)+_cb(acc.password):dash;
+    const accountId=acc.accountId?escapeHtml(acc.accountId)+_cb(acc.accountId):dash;
+    const apiKey=acc.apiKey?escapeHtml(acc.apiKey)+_cb(acc.apiKey):dash;
     const sourceName=src.name+(src.sub?' '+src.sub:'');
-    return `<tr><td><div class="platform"><div class="logo ${src.className}">${src.logo}</div><div class="name">${escapeHtml(sourceName)}</div></div></td><td>${label}</td><td>${phone}</td><td>${username}</td><td>${password}</td><td>${accountId}</td><td>${cookieStr}</td><td style="color:var(--muted)">${updatedAt}</td><td><button class="btn" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="editAccountFromTable('${id}')">编辑</button><button class="btn danger" style="padding:4px 10px;font-size:12px" onclick="deleteAccount('${id}')">删除</button></td></tr>`;
+    return `<tr><td><div class="platform"><div class="logo ${src.className}">${src.logo}</div><div class="name">${escapeHtml(sourceName)}</div></div></td><td>${label}</td><td>${phone}</td><td>${username}</td><td>${password}</td><td>${accountId}</td><td>${apiKey}</td><td>${cookieStr}</td><td style="color:var(--muted)">${updatedAt}</td><td><button class="btn" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="editAccountFromTable('${id}')">编辑</button><button class="btn danger" style="padding:4px 10px;font-size:12px" onclick="deleteAccount('${id}')">删除</button></td></tr>`;
   }).join('');
-  container.innerHTML=`<div class="accounts-table-wrap"><table class="accounts-table"><thead><tr><th>平台</th><th>备注</th><th>手机号</th><th>用户名</th><th>密码</th><th>AccountID</th><th>登录态有效期</th><th>数据更新时间</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  container.innerHTML=`<div class="accounts-table-wrap"><table class="accounts-table"><thead><tr><th>平台</th><th>备注</th><th>手机号</th><th>用户名</th><th>密码</th><th>AccountID</th><th>API Key</th><th>登录态有效期</th><th>数据更新时间</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 let editingAccountId=null;
 function editAccountFromTable(id){
-  if(locked) return;
+  if(locked){lockedAlert();return;}
   const acc=requestDefinitions[id];
   if(!acc) return;
   editingAccountId=id;
@@ -329,6 +349,7 @@ function editAccountFromTable(id){
   document.getElementById('editUsername').value=acc.username||'';
   document.getElementById('editPassword').value=acc.password||'';
   document.getElementById('editAccountId').value=acc.accountId||'';
+  document.getElementById('editApiKey').value=acc.apiKey||'';
   document.getElementById('editAccountModal').classList.remove('hidden');
 }
 function closeEditModal(){
@@ -344,12 +365,13 @@ async function saveEditModal(){
   const username=document.getElementById('editUsername').value.trim();
   const password=document.getElementById('editPassword').value.trim();
   const accountId=document.getElementById('editAccountId').value.trim();
+  const apiKey=document.getElementById('editApiKey').value.trim();
   try{
-    const body={id:editingAccountId,label,curl:acc.curl,updatedAt:now(),phone,username,password,accountId};
+    const body={id:editingAccountId,label,curl:acc.curl,updatedAt:now(),phone,username,password,accountId,apiKey};
     if(acc.source==='googleAi'){body.source='googleAi';body.refreshToken=acc.refreshToken||'';body.proxy=acc.proxy||'';}
     const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!response.ok){let msg='保存失败';try{const e=await response.json();if(e.error)msg=e.error}catch(_){}throw new Error(msg);}
-    requestDefinitions[editingAccountId]={...acc,label,phone,username,password,accountId};
+    requestDefinitions[editingAccountId]={...acc,label,phone,username,password,accountId,apiKey};
     closeEditModal();
     render();
   }catch(error){alert('保存失败：'+error.message);}
@@ -364,6 +386,7 @@ async function saveEditModal(){
     <div class="field"><label>用户名</label><input id="editUsername" type="text" placeholder="选填"></div>
     <div class="field"><label>密码</label><input id="editPassword" type="password" placeholder="选填，明文保存在本地"></div>
     <div class="field"><label>AccountID</label><input id="editAccountId" type="text" placeholder="选填"></div>
+    <div class="field"><label>API Key</label><input id="editApiKey" type="password" placeholder="选填，明文保存在本地"></div>
     <div class="actions">
       <button class="btn" onclick="closeEditModal()">取消</button>
       <button class="btn primary" onclick="saveEditModal()">保存</button>

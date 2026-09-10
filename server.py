@@ -586,7 +586,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 if source == "googleAi":
                     definition["refreshToken"] = refresh_token or existing.get("refreshToken", "")
                     definition["proxy"] = proxy_input or existing.get("proxy", "")
-                for _field in ("phone", "username", "password", "accountId"):
+                for _field in ("phone", "username", "password", "accountId", "apiKey"):
                     if _field in payload:
                         _value = str(payload[_field] or "").strip()
                         if _value:
@@ -595,7 +595,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                             del definition[_field]
                 requests[account_id] = definition
                 save_requests(self.requests_path, requests)
-                self.send_json({"ok": True, "id": account_id, "source": source})
+                _save_result = {"ok": True, "id": account_id, "source": source}
+                if "accountId" in definition:
+                    _save_result["accountId"] = definition["accountId"]
+                if "cookieExpires" in definition:
+                    _save_result["cookieExpires"] = definition["cookieExpires"]
+                self.send_json(_save_result)
                 return
             if self.path == "/api/order":
                 order = payload.get("order")
