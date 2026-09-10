@@ -5,23 +5,19 @@ from pathlib import Path
 
 from server import (
     build_http_request,
-    execute_volcengine_openapi,
     infer_source,
     is_success_status,
-    load_credentials,
     load_requests,
     load_results,
     load_order,
     load_snapshot,
     mask_secret,
     parse_curl,
-    save_credentials,
     save_order,
     save_requests,
     save_results,
     save_snapshot,
     should_skip_source,
-    volcengine_sign,
     VOLC_ACTIONS,
 )
 
@@ -166,20 +162,6 @@ class CurlImportTest(unittest.TestCase):
 
 
 class VolcengineOpenApiTest(unittest.TestCase):
-    def test_signing_produces_valid_authorization_header(self):
-        headers = volcengine_sign(
-            "AKTEST", "SKTEST", "POST", "/",
-            {"Action": "GetAgentPlanAFPUsage", "Version": "2024-01-01"},
-            b"{}", region="cn-beijing", service="ark",
-        )
-        self.assertIn("Authorization", headers)
-        self.assertTrue(headers["Authorization"].startswith("HMAC-SHA256 Credential=AKTEST/"))
-        self.assertIn("SignedHeaders=content-type;host;x-content-sha256;x-date", headers["Authorization"])
-        self.assertIn("X-Date", headers)
-        self.assertIn("X-Content-Sha256", headers)
-        self.assertEqual(headers["Host"], "open.volcengineapi.com")
-        self.assertEqual(headers["Content-Type"], "application/json")
-
     def test_volc_actions_map_sources(self):
         self.assertEqual(VOLC_ACTIONS["volcAgent"], "GetAgentPlanAFPUsage")
         self.assertEqual(VOLC_ACTIONS["volcCoding"], "GetCodingPlanUsage")
@@ -188,98 +170,6 @@ class VolcengineOpenApiTest(unittest.TestCase):
         self.assertEqual(mask_secret("abcd1234efgh"), "abcd****efgh")
         self.assertEqual(mask_secret("short"), "****")
         self.assertEqual(mask_secret(""), "")
-
-    def test_credentials_round_trip(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "creds.json"
-            save_credentials(path, {"volc": {"accessKeyId": "AK", "secretAccessKey": "SK"}})
-            loaded = load_credentials(path)
-            self.assertEqual(loaded["volc"]["accessKeyId"], "AK")
-            self.assertEqual(load_credentials(Path(tmp) / "missing.json"), {})
-
-    def test_execute_openapi_requires_credentials(self):
-        with self.assertRaises(ValueError):
-            execute_volcengine_openapi({"accessKeyId": "", "secretAccessKey": ""}, "GetAgentPlanAFPUsage")
-
-
-    def test_post_requests_preserves_curl_when_updating_creds_only(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "requests.json"
-            save_requests(path, {"acc_1": {"source": "volcCoding", "label": "acct1", "curl": "curl test1", "updatedAt": "2026-01-01"}})
-            # Update with ak/sk but no curl - should preserve existing curl
-            loaded = load_requests(path)
-            loaded["acc_1"] = {"source": "volcCoding", "label": "acct1", "curl": "curl test1", "ak": "AKTEST", "sk": "SKTEST", "updatedAt": "2026-01-02"}
-            save_requests(path, loaded)
-            result = load_requests(path)
-            self.assertEqual(result["acc_1"]["curl"], "curl test1")
-            self.assertEqual(result["acc_1"]["ak"], "AKTEST")
-            self.assertEqual(result["acc_1"]["sk"], "SKTEST")
-
-
-    def test_edit_label_on_curl_less_volc_account(self):
-        """Saving a label on an existing volc account with empty curl should succeed and preserve ak/sk."""
-        from server import DashboardHandler
-        from io import BytesIO
-        import json as _json
-
-        with tempfile.TemporaryDirectory() as tmp:
-            req_path = Path(tmp) / "requests.json"
-            save_requests(req_path, {"acc_existing": {"source": "volcCoding", "label": "old", "curl": "", "ak": "AK_OLD", "sk": "SK_OLD_LONG_VALUE", "updatedAt": "2026-01-01"}})
-            DashboardHandler.requests_path = req_path
-            DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
-            DashboardHandler.results_path = Path(tmp) / "results.json"
-            DashboardHandler.credentials_path = Path(tmp) / "credentials.json"
-            DashboardHandler.order_path = Path(tmp) / "order.json"
-
-            body = _json.dumps({"id": "acc_existing", "label": "new-label", "curl": "", "updatedAt": "2026-07-20T14:09:09.529Z"}).encode()
-            handler = DashboardHandler.__new__(DashboardHandler)
-            handler.path = "/api/requests"
-            handler.headers = {"Content-Length": str(len(body))}
-            handler.rfile = BytesIO(body)
-            captured = {}
-            handler.send_json = lambda payload: captured.update({"payload": payload})
-            handler.wfile = BytesIO()
-
-            DashboardHandler.do_POST(handler)
-
-            self.assertEqual(captured["payload"]["source"], "volcCoding")
-            result = load_requests(req_path)["acc_existing"]
-            self.assertEqual(result["label"], "new-label")
-            self.assertEqual(result["curl"], "")
-            self.assertEqual(result["ak"], "AK_OLD")
-            self.assertEqual(result["sk"], "SK_OLD_LONG_VALUE")
-
-    def test_update_ak_sk_on_curl_less_volc_account(self):
-        """Updating AK/SK on an existing volc account with empty curl should succeed with new creds."""
-        from server import DashboardHandler
-        from io import BytesIO
-        import json as _json
-
-        with tempfile.TemporaryDirectory() as tmp:
-            req_path = Path(tmp) / "requests.json"
-            save_requests(req_path, {"acc_existing": {"source": "volcAgent", "label": "agent", "curl": "", "ak": "AK_OLD", "sk": "SK_OLD_LONG_VALUE", "updatedAt": "2026-01-01"}})
-            DashboardHandler.requests_path = req_path
-            DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
-            DashboardHandler.results_path = Path(tmp) / "results.json"
-            DashboardHandler.credentials_path = Path(tmp) / "credentials.json"
-            DashboardHandler.order_path = Path(tmp) / "order.json"
-
-            body = _json.dumps({"id": "acc_existing", "label": "agent", "ak": "AK_NEW", "sk": "SK_NEW_LONG_VALUE", "curl": "", "updatedAt": "2026-07-20T14:09:09.529Z"}).encode()
-            handler = DashboardHandler.__new__(DashboardHandler)
-            handler.path = "/api/requests"
-            handler.headers = {"Content-Length": str(len(body))}
-            handler.rfile = BytesIO(body)
-            captured = {}
-            handler.send_json = lambda payload: captured.update({"payload": payload})
-            handler.wfile = BytesIO()
-
-            DashboardHandler.do_POST(handler)
-
-            self.assertEqual(captured["payload"]["source"], "volcAgent")
-            result = load_requests(req_path)["acc_existing"]
-            self.assertEqual(result["ak"], "AK_NEW")
-            self.assertEqual(result["sk"], "SK_NEW_LONG_VALUE")
-
 
     def test_create_google_ai_account_without_curl(self):
         """POST /api/requests with source=googleAi + refreshToken + no curl should succeed."""
@@ -292,7 +182,6 @@ class VolcengineOpenApiTest(unittest.TestCase):
             DashboardHandler.requests_path = req_path
             DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
             DashboardHandler.results_path = Path(tmp) / "results.json"
-            DashboardHandler.credentials_path = Path(tmp) / "credentials.json"
             DashboardHandler.order_path = Path(tmp) / "order.json"
 
             body = _json.dumps({
@@ -329,7 +218,6 @@ class VolcengineOpenApiTest(unittest.TestCase):
             DashboardHandler.requests_path = req_path
             DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
             DashboardHandler.results_path = Path(tmp) / "results.json"
-            DashboardHandler.credentials_path = Path(tmp) / "credentials.json"
             DashboardHandler.order_path = Path(tmp) / "order.json"
 
             body = _json.dumps({"source": "googleAi", "label": "no-token"}).encode()
@@ -357,7 +245,6 @@ class VolcengineOpenApiTest(unittest.TestCase):
             DashboardHandler.requests_path = req_path
             DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
             DashboardHandler.results_path = Path(tmp) / "results.json"
-            DashboardHandler.credentials_path = Path(tmp) / "credentials.json"
             DashboardHandler.order_path = Path(tmp) / "order.json"
 
             body = _json.dumps({"id": "acc_g", "label": "new", "curl": "", "updatedAt": "2026-07-22T00:00:00Z"}).encode()
@@ -405,145 +292,3 @@ class AccountOrderTest(unittest.TestCase):
             path = Path(tmp) / "order.json"
             save_snapshot(path, {"order": "not-a-list"})
             self.assertEqual(load_order(path), [])
-
-
-class VolcAkSkAccountCreationTest(unittest.TestCase):
-    def test_create_volg_coding_account_without_curl(self):
-        """POST /api/requests with explicit source + ak + sk + no curl should succeed for volcCoding."""
-        from server import DashboardHandler
-        from io import BytesIO
-        import json as _json
-
-        with tempfile.TemporaryDirectory() as tmp:
-            req_path = Path(tmp) / "requests.json"
-            DashboardHandler.requests_path = req_path
-            DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
-            DashboardHandler.results_path = Path(tmp) / "results.json"
-            DashboardHandler.credentials_path = Path(tmp) / "credentials.json"
-            DashboardHandler.order_path = Path(tmp) / "order.json"
-
-            body = _json.dumps({
-                "source": "volcCoding",
-                "label": "my-coding-account",
-                "ak": "AK_TEST",
-                "sk": "SK_TEST_VALUE_LONG_ENOUGH",
-            }).encode()
-            handler = DashboardHandler.__new__(DashboardHandler)
-            handler.path = "/api/requests"
-            handler.headers = {"Content-Length": str(len(body))}
-            handler.rfile = BytesIO(body)
-            captured = {}
-            def _capture(payload):
-                captured["payload"] = payload
-            handler.send_json = lambda payload: _capture(payload)
-            handler.wfile = BytesIO()
-
-            DashboardHandler.do_POST(handler)
-
-            self.assertIsNotNone(captured["payload"])
-            self.assertEqual(captured["payload"]["source"], "volcCoding")
-            requests = load_requests(req_path)
-            self.assertEqual(len(requests), 1)
-            saved_id = next(iter(requests))
-            saved = requests[saved_id]
-            self.assertEqual(saved["source"], "volcCoding")
-            self.assertEqual(saved["ak"], "AK_TEST")
-            self.assertEqual(saved["sk"], "SK_TEST_VALUE_LONG_ENOUGH")
-            self.assertEqual(saved["label"], "my-coding-account")
-            self.assertEqual(saved["curl"], "")
-
-    def test_create_volc_agent_account_without_curl(self):
-        from server import DashboardHandler
-        from io import BytesIO
-        import json as _json
-
-        with tempfile.TemporaryDirectory() as tmp:
-            req_path = Path(tmp) / "requests.json"
-            DashboardHandler.requests_path = req_path
-            DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
-            DashboardHandler.results_path = Path(tmp) / "results.json"
-            DashboardHandler.credentials_path = Path(tmp) / "credentials.json"
-            DashboardHandler.order_path = Path(tmp) / "order.json"
-
-            body = _json.dumps({
-                "source": "volcAgent",
-                "label": "agent-1",
-                "ak": "AK_AGENT",
-                "sk": "SK_AGENT_VALUE_LONG_ENOUGH",
-            }).encode()
-            handler = DashboardHandler.__new__(DashboardHandler)
-            handler.path = "/api/requests"
-            handler.headers = {"Content-Length": str(len(body))}
-            handler.rfile = BytesIO(body)
-            captured = {}
-            def _capture(payload):
-                captured["payload"] = payload
-            handler.send_json = lambda payload: _capture(payload)
-            handler.wfile = BytesIO()
-
-            DashboardHandler.do_POST(handler)
-
-            self.assertIsNotNone(captured["payload"])
-            self.assertEqual(captured["payload"]["source"], "volcAgent")
-
-    def test_create_non_volc_account_without_curl_rejected(self):
-        from server import DashboardHandler
-        from io import BytesIO
-        import json as _json
-
-        with tempfile.TemporaryDirectory() as tmp:
-            req_path = Path(tmp) / "requests.json"
-            DashboardHandler.requests_path = req_path
-            DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
-            DashboardHandler.results_path = Path(tmp) / "results.json"
-            DashboardHandler.credentials_path = Path(tmp) / "credentials.json"
-            DashboardHandler.order_path = Path(tmp) / "order.json"
-
-            body = _json.dumps({
-                "source": "minimax",
-                "label": "no-curl",
-                "ak": "AK_X",
-                "sk": "SK_X",
-            }).encode()
-            handler = DashboardHandler.__new__(DashboardHandler)
-            handler.path = "/api/requests"
-            handler.headers = {"Content-Length": str(len(body))}
-            handler.rfile = BytesIO(body)
-            errors = {}
-            handler.send_error = lambda code, msg=None: errors.update({"code": code, "msg": msg})
-            handler.wfile = BytesIO()
-
-            DashboardHandler.do_POST(handler)
-
-            self.assertEqual(errors["code"], 400)
-            self.assertIn("curl is required", errors["msg"])
-
-    def test_create_volc_account_without_ak_sk_rejected(self):
-        from server import DashboardHandler
-        from io import BytesIO
-        import json as _json
-
-        with tempfile.TemporaryDirectory() as tmp:
-            req_path = Path(tmp) / "requests.json"
-            DashboardHandler.requests_path = req_path
-            DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
-            DashboardHandler.results_path = Path(tmp) / "results.json"
-            DashboardHandler.credentials_path = Path(tmp) / "credentials.json"
-            DashboardHandler.order_path = Path(tmp) / "order.json"
-
-            body = _json.dumps({
-                "source": "volcCoding",
-                "label": "missing-ak-sk",
-            }).encode()
-            handler = DashboardHandler.__new__(DashboardHandler)
-            handler.path = "/api/requests"
-            handler.headers = {"Content-Length": str(len(body))}
-            handler.rfile = BytesIO(body)
-            errors = {}
-            handler.send_error = lambda code, msg=None: errors.update({"code": code, "msg": msg})
-            handler.wfile = BytesIO()
-
-            DashboardHandler.do_POST(handler)
-
-            self.assertEqual(errors["code"], 400)
-            self.assertIn("ak and sk are required", errors["msg"])

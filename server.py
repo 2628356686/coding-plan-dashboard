@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import json
@@ -59,58 +60,6 @@ def _volc_norm_query(params):
     return query[:-1].replace("+", "%20")
 
 
-def _volc_hmac(key, content):
-    if isinstance(key, str):
-        key = key.encode("utf-8")
-    return hmac.new(key, content.encode("utf-8"), hashlib.sha256).digest()
-
-
-def volcengine_sign(ak, sk, method, path, query, body, region=VOLC_REGION, service=VOLC_SERVICE, content_type="application/json"):
-    now = datetime.now(timezone.utc)
-    x_date = now.strftime("%Y%m%dT%H%M%SZ")
-    x_date_short = x_date[:8]
-    if isinstance(body, str):
-        body = body.encode("utf-8")
-    body_hash = hashlib.sha256(body or b"").hexdigest()
-    headers = {"Host": VOLC_OPENAPI_HOST, "X-Date": x_date, "X-Content-Sha256": body_hash, "Content-Type": content_type}
-    signed_headers = {}
-    for key, value in headers.items():
-        if key in ("Content-Type", "Content-Md5", "Host") or key.startswith("X-"):
-            signed_headers[key.lower()] = value
-    signed_str = "".join(f"{key}:{signed_headers[key]}\n" for key in sorted(signed_headers.keys()))
-    sh = ";".join(sorted(signed_headers.keys()))
-    canonical_request = "\n".join([method, quote(path, safe="/-_.~").replace("%2F", "/").replace("+", "%20"), _volc_norm_query(query), signed_str, sh, body_hash])
-    credential_scope = f"{x_date_short}/{region}/{service}/request"
-    hashed_canonical = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
-    string_to_sign = "\n".join(["HMAC-SHA256", x_date, credential_scope, hashed_canonical])
-    k_date = _volc_hmac(sk, x_date_short)
-    k_region = _volc_hmac(k_date, region)
-    k_service = _volc_hmac(k_region, service)
-    k_signing = _volc_hmac(k_service, "request")
-    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-    headers["Authorization"] = f"HMAC-SHA256 Credential={ak}/{credential_scope}, SignedHeaders={sh}, Signature={signature}"
-    return headers
-
-
-def execute_volcengine_openapi(credentials, action):
-    ak = credentials.get("accessKeyId", "")
-    sk = credentials.get("secretAccessKey", "")
-    if not ak or not sk:
-        raise ValueError("missing volcengine credentials")
-    query = {"Action": action, "Version": "2024-01-01"}
-    body = b"{}"
-    headers = volcengine_sign(ak, sk, "POST", "/", query, body)
-    url = f"https://{VOLC_OPENAPI_HOST}/?{_volc_norm_query(query)}"
-    request = Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urlopen(request, timeout=35) as response:
-            return response.status, response.read().decode("utf-8", errors="replace"), ""
-    except HTTPError as error:
-        return error.code, error.read().decode("utf-8", errors="replace"), f"HTTP {error.code}"
-    except URLError as error:
-        return 1, "", str(error.reason)
-
-
 GOOGLE_OAUTH_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_UA = "antigravity-tools/1.1.5"
 GOOGLE_BASES = [
@@ -156,7 +105,7 @@ def _load_google_clients():
 
 
 GOOGLE_CLIENTS = _load_google_clients()
-CREDENTIAL_SOURCES = set(VOLC_ACTIONS) | {"googleAi"}
+CREDENTIAL_SOURCES = {"googleAi"}
 
 
 def _google_opener(proxy):
@@ -222,15 +171,6 @@ def mask_secret(secret):
     return secret[:4] + "****" + secret[-4:]
 
 
-def load_credentials(path):
-    value = load_snapshot(path)
-    return value if isinstance(value, dict) else {}
-
-
-def save_credentials(path, credentials):
-    save_snapshot(path, credentials)
-
-
 def load_order(path):
     value = load_snapshot(path)
     if not isinstance(value, dict):
@@ -291,12 +231,16 @@ COMBINED_FLAGS = {"-sS", "-Ss", "-fsS", "-sSf"}
 
 
 def parse_curl(command):
-    normalized = command.replace("\\\n", " ").strip()
+    # Normalize line continuations: bash-style (\\) and cmd-style (^), both CRLF and LF
+    normalized = command
+    for sep in ("\r\n", "\n"):
+        normalized = normalized.replace("\\" + sep, " ").replace("^" + sep, " ")
+    normalized = normalized.strip()
     if not normalized or "\n" in normalized or "\r" in normalized:
-        raise ValueError("curl command contains unsupported shell syntax")
+        raise ValueError("curl 命令包含未处理的换行，请确认复制的是完整的 cURL (bash) 或 cURL (cmd) 格式")
     tokens = shlex.split(normalized)
-    if not tokens or Path(tokens[0]).name != "curl":
-        raise ValueError("command must start with curl")
+    if not tokens or Path(tokens[0]).name.lower() not in ("curl", "curl.exe"):
+        raise ValueError("命令必须以 curl 开头，请确认复制的是 cURL 格式而非 PowerShell / fetch 格式")
     args = ["curl"]
     urls = []
     index = 1
@@ -313,24 +257,110 @@ def parse_curl(command):
         if token in ALLOWED_OPTIONS_WITH_VALUE:
             if index + 1 >= len(tokens):
                 raise ValueError(f"missing value for {token}")
-            args.extend([token, tokens[index + 1]])
+            value = tokens[index + 1]
+            args.extend([token, value])
+            if token == "--url":
+                urls.append(value)
             index += 2
             continue
         if token.startswith("-"):
             raise ValueError(f"unsupported curl option: {token}")
         urls.append(token)
         index += 1
-    if len(urls) != 1:
-        raise ValueError("curl command must contain exactly one URL")
+    if len(urls) == 0:
+        raise ValueError("未找到请求 URL，请确认复制的是完整的 cURL 命令（包含 --url 或直接跟在 curl 后的 URL）")
+    if len(urls) > 1:
+        raise ValueError(f"找到 {len(urls)} 个 URL，cURL 命令只能包含一个请求 URL")
     parsed = urlparse(urls[0])
     if parsed.hostname in ALLOWED_HOSTS and parsed.scheme == "https":
         pass
     elif _newapi_request_allowed(parsed):
         pass
     else:
-        raise ValueError("URL host is not allowed")
+        raise ValueError(f"不支持的请求域名：{parsed.hostname or '(空)'}，仅支持已配置的平台域名")
     args.append(urls[0])
     return urls[0], args
+
+
+
+def extract_cookie_expiry(curl_command):
+    """Extract JWT expiry (Unix timestamp) from curl cookie. Returns int or None."""
+    try:
+        _, args = parse_curl(curl_command)
+    except Exception:
+        return None
+    cookie_str = None
+    for i, arg in enumerate(args):
+        if arg in ("-b", "--cookie") and i + 1 < len(args):
+            cookie_str = args[i + 1]
+            break
+    if not cookie_str:
+        return None
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        _, value = part.split("=", 1)
+        value = value.strip()
+        if not value.startswith("eyJ") or value.count(".") < 2:
+            continue
+        try:
+            payload_b64 = value.split(".")[1]
+            padding = 4 - len(payload_b64) % 4
+            if padding != 4:
+                payload_b64 += "=" * padding
+            payload_json = base64.urlsafe_b64decode(payload_b64).decode("utf-8")
+            payload = json.loads(payload_json)
+            exp = payload.get("exp")
+            if exp and isinstance(exp, (int, float)):
+                return int(exp)
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+    return None
+
+
+def extract_account_id(curl_command):
+    """Extract AccountID from curl cookie (AccountID= field or JWT sub/acc_i). Returns str or None."""
+    try:
+        _, args = parse_curl(curl_command)
+    except Exception:
+        return None
+    cookie_str = None
+    for i, arg in enumerate(args):
+        if arg in ("-b", "--cookie") and i + 1 < len(args):
+            cookie_str = args[i + 1]
+            break
+    if not cookie_str:
+        return None
+    # Direct cookie field: AccountID=xxx
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if part.startswith("AccountID="):
+            value = part[len("AccountID="):].strip()
+            if value:
+                return value
+    # Fallback: JWT payload sub / acc_i
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        _, value = part.split("=", 1)
+        value = value.strip()
+        if not value.startswith("eyJ") or value.count(".") < 2:
+            continue
+        try:
+            payload_b64 = value.split(".")[1]
+            padding = 4 - len(payload_b64) % 4
+            if padding != 4:
+                payload_b64 += "=" * padding
+            payload_json = base64.urlsafe_b64decode(payload_b64).decode("utf-8")
+            payload = json.loads(payload_json)
+            for key in ("sub", "acc_i"):
+                if payload.get(key):
+                    return str(payload[key])
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+    return None
 
 
 def infer_source(command):
@@ -458,8 +488,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     snapshot_path = Path(os.environ.get("SNAPSHOT_PATH", "/data/snapshot.json"))
     requests_path = Path(os.environ.get("REQUESTS_PATH", "/data/requests.json"))
     results_path = Path(os.environ.get("RESULTS_PATH", "/data/results.json"))
-    credentials_path = Path(os.environ.get("CREDENTIALS_PATH", "/data/credentials.json"))
     order_path = Path(os.environ.get("ORDER_PATH", "/data/order.json"))
+    index_path = Path(os.environ.get("INDEX_HTML_PATH", "/srv/index.html"))
+
+    def send_error(self, code, message=None, explain=None):
+        body = json.dumps({"error": message or explain or str(code)}, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
         if self.path == "/api/snapshot":
@@ -485,16 +523,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/order":
             self.send_json({"order": load_order(self.order_path)})
             return
-        if self.path == "/api/credentials":
-            creds = load_credentials(self.credentials_path)
-            masked = {}
-            for source, cred in creds.items():
-                if isinstance(cred, dict):
-                    masked[source] = {"accessKeyId": cred.get("accessKeyId", ""), "secretAccessKey": mask_secret(cred.get("secretAccessKey", "")), "configured": bool(cred.get("accessKeyId") and cred.get("secretAccessKey"))}
-            self.send_json(masked)
-            return
         if self.path in ("", "/", "/index.html"):
-            html_path = Path("/srv/index.html")
+            html_path = self.index_path
             if html_path.exists():
                 body = html_path.read_bytes()
                 self.send_response(200)
@@ -507,7 +537,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self):
-        if self.path not in {"/api/snapshot", "/api/requests", "/api/refresh", "/api/credentials", "/api/order"}:
+        if self.path not in {"/api/snapshot", "/api/requests", "/api/refresh", "/api/order"}:
             self.send_error(404)
             return
         try:
@@ -525,8 +555,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 account_id = str(payload.get("id", "")).strip()
                 curl = str(payload.get("curl", "")).strip()
                 label = str(payload.get("label", "")).strip()
-                ak = str(payload.get("ak", "")).strip()
-                sk_input = str(payload.get("sk", "")).strip()
                 refresh_token = str(payload.get("refreshToken", "")).strip()
                 proxy_input = str(payload.get("proxy", "")).strip()
                 explicit_source = str(payload.get("source", "")).strip()
@@ -538,8 +566,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     source = infer_source(curl)
                 elif explicit_source in CREDENTIAL_SOURCES and not existing:
                     source = explicit_source
-                    if source in VOLC_ACTIONS and not (ak and sk_input):
-                        raise ValueError("ak and sk are required for volcengine accounts")
                     if source == "googleAi" and not refresh_token:
                         raise ValueError("refreshToken is required for google ai accounts")
                     curl = ""
@@ -550,27 +576,26 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     raise ValueError("curl is required")
                 account_id = account_id or f"acc_{uuid.uuid4().hex[:12]}"
                 definition = {"source": source, "label": label, "curl": curl, "updatedAt": payload.get("updatedAt")}
-                if source in VOLC_ACTIONS:
-                    definition["ak"] = ak or existing.get("ak", "")
-                    definition["sk"] = sk_input or existing.get("sk", "")
+                if curl:
+                    cookie_expires = extract_cookie_expiry(curl)
+                    if cookie_expires:
+                        definition["cookieExpires"] = cookie_expires
+                    auto_account_id = extract_account_id(curl)
+                    if auto_account_id:
+                        definition["accountId"] = auto_account_id
                 if source == "googleAi":
                     definition["refreshToken"] = refresh_token or existing.get("refreshToken", "")
                     definition["proxy"] = proxy_input or existing.get("proxy", "")
+                for _field in ("phone", "username", "password", "accountId"):
+                    if _field in payload:
+                        _value = str(payload[_field] or "").strip()
+                        if _value:
+                            definition[_field] = _value
+                        elif _field in definition:
+                            del definition[_field]
                 requests[account_id] = definition
                 save_requests(self.requests_path, requests)
                 self.send_json({"ok": True, "id": account_id, "source": source})
-                return
-            if self.path == "/api/credentials":
-                source = str(payload.get("source", "volc")).strip()
-                ak = str(payload.get("accessKeyId", "")).strip()
-                sk = str(payload.get("secretAccessKey", "")).strip()
-                creds = load_credentials(self.credentials_path)
-                if not ak and not sk:
-                    creds.pop(source, None)
-                else:
-                    creds[source] = {"accessKeyId": ak, "secretAccessKey": sk}
-                save_credentials(self.credentials_path, creds)
-                self.send_json({"ok": True, "source": source})
                 return
             if self.path == "/api/order":
                 order = payload.get("order")
@@ -582,7 +607,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return
             results = {}
             cached_results = load_results(self.results_path)
-            credentials = load_credentials(self.credentials_path)
             accounts = load_requests(self.requests_path)
             for account_id, definition in accounts.items():
                 source = definition.get("source", "")
@@ -590,12 +614,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     continue
                 try:
                     if source in VOLC_ACTIONS:
-                        ak = definition.get("ak") or credentials.get("volc", {}).get("accessKeyId", "")
-                        sk = definition.get("sk") or credentials.get("volc", {}).get("secretAccessKey", "")
-                        if ak and sk:
-                            code, stdout, stderr = execute_volcengine_openapi({"accessKeyId": ak, "secretAccessKey": sk}, VOLC_ACTIONS[source])
-                        else:
-                            code, stdout, stderr = execute_curl(definition.get("curl", ""))
+                        code, stdout, stderr = execute_curl(definition.get("curl", ""))
                     elif source == "googleAi":
                         refresh_token = definition.get("refreshToken") or credentials.get("googleAi", {}).get("refreshToken", "")
                         proxy = definition.get("proxy") or os.environ.get("GOOGLE_AI_PROXY", "")
@@ -649,6 +668,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    os.chdir("/srv")
+    os.chdir(os.environ.get("APP_DIR", "/srv"))
     server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "80"))), DashboardHandler)
     server.serve_forever()
