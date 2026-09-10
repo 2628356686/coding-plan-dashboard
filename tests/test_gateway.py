@@ -15,6 +15,56 @@ import server
 REAL_SELECT = server.select_gateway_account
 
 
+class ImageConversionTest(unittest.TestCase):
+    def test_anthropic_images_convert_to_openai_parts(self):
+        body = {'model': 'm', 'max_tokens': 10, 'messages': [{'role': 'user', 'content': [
+            {'type': 'text', 'text': '这是什么'},
+            {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': 'QUJD'}},
+            {'type': 'image', 'source': {'type': 'url', 'url': 'https://example.com/a.png'}},
+        ]}]}
+        content = server.anthropic_to_openai(body)['messages'][0]['content']
+        self.assertEqual(content[0], {'type': 'text', 'text': '这是什么'})
+        self.assertEqual(content[1], {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,QUJD'}})
+        self.assertEqual(content[2], {'type': 'image_url', 'image_url': {'url': 'https://example.com/a.png'}})
+
+    def test_anthropic_text_only_content_stays_a_string(self):
+        body = {'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': 'a'}, {'type': 'text', 'text': 'b'}]}]}
+        content = server.anthropic_to_openai(body)['messages'][0]['content']
+        self.assertEqual(content, 'ab')
+
+    def test_openai_images_convert_to_anthropic_blocks(self):
+        body = {'model': 'm', 'messages': [
+            {'role': 'system', 'content': [
+                {'type': 'text', 'text': 'sys'},
+                {'type': 'image_url', 'image_url': {'url': 'https://example.com/s.png'}}]},
+            {'role': 'user', 'content': [
+                {'type': 'text', 'text': '看图'},
+                {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,QUJD'}},
+                {'type': 'image_url', 'image_url': {'url': 'https://example.com/a.png'}},
+                {'type': 'image_url', 'image_url': {'url': 'ftp://unsupported'}},
+            ]}]}
+        result = server.openai_to_anthropic_request(body)
+        self.assertEqual(result['system'], 'sys')
+        content = result['messages'][0]['content']
+        self.assertEqual(content[0], {'type': 'text', 'text': '看图'})
+        self.assertEqual(content[1], {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': 'QUJD'}})
+        self.assertEqual(content[2], {'type': 'image', 'source': {'type': 'url', 'url': 'https://example.com/a.png'}})
+        self.assertEqual(len(content), 3)
+
+    def test_responses_input_image_survives_conversion(self):
+        body = {'model': 'm', 'input': [
+            {'role': 'user', 'content': [
+                {'type': 'input_text', 'text': '看图'},
+                {'type': 'input_image', 'image_url': 'data:image/png;base64,QUJD'},
+            ]},
+            {'type': 'input_image', 'image_url': 'https://example.com/a.png'},
+        ]}
+        messages = server.responses_to_openai(body)['messages']
+        self.assertEqual(messages[0]['content'][0], {'type': 'text', 'text': '看图'})
+        self.assertEqual(messages[0]['content'][1], {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,QUJD'}})
+        self.assertEqual(messages[1]['content'][0], {'type': 'image_url', 'image_url': {'url': 'https://example.com/a.png'}})
+
+
 class GatewayProtocolsTest(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
@@ -199,6 +249,24 @@ class GatewayProtocolsTest(unittest.TestCase):
                         self.assertEqual([e['sequence_number'] for e in events], list(range(len(events))))
                 finally:
                     self.release_stream.set()
+
+    def test_image_content_reaches_openai_upstream_from_anthropic_inbound(self):
+        self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream}}
+        body = {'model': 'test-model', 'stream': False, 'max_tokens': 10,
+                'messages': [{'role': 'user', 'content': [
+                    {'type': 'text', 'text': '这是什么'},
+                    {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': 'QUJD'}},
+                ]}]}
+        req = Request(self.gateway + '/v1/messages', data=json.dumps(body).encode(),
+                      headers={'x-api-key': 'test-only', 'Content-Type': 'application/json'})
+        with urlopen(req, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            json.load(response)
+        path, upstream_body = self.requests[-1]
+        self.assertEqual(path, '/chat/completions')
+        content = upstream_body['messages'][0]['content']
+        self.assertEqual(content[0], {'type': 'text', 'text': '这是什么'})
+        self.assertIn({'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,QUJD'}}, content)
 
     def test_upstream_errors_are_not_successful_empty_messages(self):
         self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream}}

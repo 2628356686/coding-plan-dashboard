@@ -759,6 +759,18 @@ def record_gateway_request(account_id):
 
 # ---- Protocol conversion (inbound -> OpenAI upstream) ----
 
+def anthropic_image_to_openai_url(source):
+    """Anthropic image source -> URL for OpenAI image_url parts."""
+    source = source or {}
+    if source.get("type") == "base64":
+        media = str(source.get("media_type") or "image/png")
+        data = source.get("data", "")
+        if data:
+            return "data:%s;base64,%s" % (media, data)
+        return ""
+    return str(source.get("url") or "")
+
+
 def anthropic_to_openai(body):
     messages = []
     if body.get("system"):
@@ -776,12 +788,20 @@ def anthropic_to_openai(body):
         role = msg.get("role", "user")
         content = msg.get("content", "")
         if isinstance(content, list):
-            text_parts = [
-                part.get("text", "")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            ]
-            content = "".join(text_parts)
+            parts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    parts.append({"type": "text", "text": part.get("text", "")})
+                elif part.get("type") == "image":
+                    url = anthropic_image_to_openai_url(part.get("source"))
+                    if url:
+                        parts.append({"type": "image_url", "image_url": {"url": url}})
+            if all(part.get("type") == "text" for part in parts):
+                content = "".join(part.get("text", "") for part in parts)
+            else:
+                content = parts
         messages.append({"role": role, "content": content})
     result = {"messages": messages}
     for key in ("model", "max_tokens", "temperature", "top_p", "stream"):
@@ -808,30 +828,61 @@ def openai_to_anthropic(body, model):
     }
 
 
+def responses_image_url(part):
+    """Responses input_image part -> image URL string, or None."""
+    url = part.get("image_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    return str(url) if url else None
+
+
 def responses_to_openai(body):
     messages = []
     if body.get("instructions"):
         messages.append({"role": "system", "content": str(body["instructions"])})
+
+    def content_to_openai(content):
+        """Message content list -> OpenAI content (string, or list with images)."""
+        if not isinstance(content, list):
+            return content
+        text_parts = []
+        image_parts = []
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") in ("input_text", "output_text"):
+                text_parts.append(c.get("text", ""))
+            elif c.get("type") == "input_image":
+                url = responses_image_url(c)
+                if url:
+                    image_parts.append({"type": "image_url", "image_url": {"url": url}})
+        if image_parts:
+            return ([{"type": "text", "text": text} for text in text_parts if text] + image_parts)
+        return "".join(text_parts)
+
     user_input = body.get("input", "")
     if isinstance(user_input, list):
         text_parts = []
+        image_parts = []
         for item in user_input:
             if isinstance(item, dict):
                 if item.get("type") == "message" or "role" in item:
-                    content = item.get("content", [])
-                    if isinstance(content, str):
-                        messages.append({"role": item.get("role", "user"), "content": content})
-                        continue
-                    item_text = []
-                    for c in item.get("content", []):
-                        if isinstance(c, dict) and c.get("type") in ("input_text", "output_text"):
-                            item_text.append(c.get("text", ""))
-                    messages.append({"role": item.get("role", "user"), "content": "".join(item_text)})
+                    messages.append({
+                        "role": item.get("role", "user"),
+                        "content": content_to_openai(item.get("content", [])),
+                    })
                 elif item.get("type") == "input_text":
                     text_parts.append(item.get("text", ""))
-        user_input = "".join(text_parts)
+                elif item.get("type") == "input_image":
+                    url = responses_image_url(item)
+                    if url:
+                        image_parts.append({"type": "image_url", "image_url": {"url": url}})
+        if image_parts:
+            user_input = [{"type": "text", "text": text} for text in text_parts if text] + image_parts
+        else:
+            user_input = "".join(text_parts)
     if user_input:
-        messages.append({"role": "user", "content": str(user_input)})
+        messages.append({"role": "user", "content": user_input})
     result = {"messages": messages}
     for key in ("model", "temperature", "top_p", "stream"):
         if body.get(key) is not None:
@@ -1033,6 +1084,20 @@ def gateway_message_events(message, protocol):
 # ---- Upstream forwarding ----
 
 
+def openai_image_url_to_anthropic_source(url):
+    """OpenAI image_url value -> Anthropic image source, or None if unsupported."""
+    url = str(url or "")
+    if url.startswith("data:"):
+        header, _, data = url.partition(",")
+        if ";base64" not in header or not data:
+            return None
+        media = header[5:].split(";", 1)[0] or "image/png"
+        return {"type": "base64", "media_type": media, "data": data}
+    if url.startswith("http://") or url.startswith("https://"):
+        return {"type": "url", "url": url}
+    return None
+
+
 def openai_to_anthropic_request(body):
     """OpenAI chat/completions request -> Anthropic messages request."""
     messages = []
@@ -1042,17 +1107,34 @@ def openai_to_anthropic_request(body):
             continue
         role = msg.get("role", "user")
         content = msg.get("content", "")
+        blocks = None
         if isinstance(content, list):
-            text_parts = [
-                part.get("text", "")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            ]
-            content = "".join(text_parts)
+            blocks = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    blocks.append({"type": "text", "text": part.get("text", "")})
+                elif part.get("type") == "image_url":
+                    image_url = part.get("image_url")
+                    if isinstance(image_url, dict):
+                        image_url = image_url.get("url")
+                    source = openai_image_url_to_anthropic_source(image_url)
+                    if source:
+                        blocks.append({"type": "image", "source": source})
+            if all(block.get("type") == "text" for block in blocks):
+                content = "".join(block.get("text", "") for block in blocks)
+            else:
+                content = blocks
         if role == "system":
-            system_text = str(content)
+            if blocks is not None:
+                system_text = "".join(
+                    block.get("text", "") for block in blocks if block.get("type") == "text"
+                )
+            else:
+                system_text = str(content)
         else:
-            messages.append({"role": role, "content": str(content)})
+            messages.append({"role": role, "content": content})
     result = {"messages": messages}
     if system_text:
         result["system"] = system_text
@@ -1400,7 +1482,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     def _gateway_read_body(self):
         length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0 or length > 5242880:
+        # 20 MB: base64 image blocks from coding agents easily exceed 5 MB.
+        if length <= 0 or length > 20971520:
             raise ValueError("invalid payload size")
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8")), raw
