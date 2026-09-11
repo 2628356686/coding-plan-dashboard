@@ -88,6 +88,7 @@ class GatewayProtocolsTest(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.requests = []
+        self.routing_states = []
         self.failure = None
         self.failures = []
         self.stack.enter_context(patch.dict(server._gateway_cooldowns, {}, clear=True))
@@ -105,6 +106,7 @@ class GatewayProtocolsTest(unittest.TestCase):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 owner.requests.append((self.path, body))
+                owner.routing_states.append((server.gateway_active_snapshot(), dict(server._gateway_cooldowns)))
                 protocol = 'anthropic' if self.path.endswith('/messages') else 'openai'
                 if protocol == 'anthropic':
                     message = {'id': 'msg_test', 'type': 'message', 'role': 'assistant',
@@ -411,7 +413,7 @@ class GatewayProtocolsTest(unittest.TestCase):
                         error.exception.close()
                         self.wait_active(0)
 
-    def test_quota_error_retries_another_account_for_all_protocols(self):
+    def test_quota_error_retries_same_account_for_all_protocols(self):
         accounts = {'first': {'apiKey': 'test-only'}, 'second': {'apiKey': 'test-only'}}
         self.config['maxRetries'] = 2
         self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream, 'anthropicBaseUrl': self.upstream}}
@@ -424,15 +426,58 @@ class GatewayProtocolsTest(unittest.TestCase):
                     with self.subTest(protocol=protocol, stream=stream):
                         server._gateway_cooldowns.clear()
                         self.requests.clear()
+                        self.routing_states.clear()
                         self.failures = [(429, b'{"error":"quota exceeded"}', 'application/json')]
                         with self.call(protocol, stream) as response:
                             text = response.read().decode()
                             self.assertEqual(response.status, 200)
                             self.assertNotIn('quota exceeded', text)
                         self.assertEqual(len(self.requests), 2)
-                        self.assertIn('first', server._gateway_cooldowns)
-                        self.assertNotIn('second', server._gateway_cooldowns)
+                        self.assertEqual(server._gateway_cooldowns, {})
+                        reservations = [state['activeRequests'][0] for state, _ in self.routing_states]
+                        self.assertEqual([r['accountId'] for r in reservations], ['first', 'first'])
+                        self.assertEqual(reservations[0]['id'], reservations[1]['id'])
+                        self.assertTrue(all(not cooldowns for _, cooldowns in self.routing_states))
                         self.wait_active(0)
+
+    def test_retry_limit_cools_account_then_fails_over_or_returns_503(self):
+        self.config['maxRetries'] = 3
+        self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream, 'anthropicBaseUrl': self.upstream}}
+        for account_count in (1, 2):
+            accounts = {'first': {'apiKey': 'test-only'}}
+            if account_count == 2:
+                accounts['second'] = {'apiKey': 'test-only'}
+            with patch.object(server, 'load_requests', return_value=accounts), \
+                 patch.object(server, 'select_gateway_account', REAL_SELECT), \
+                 patch.object(server.random, 'choices', side_effect=lambda candidates, **kwargs: [candidates[0]]):
+                for protocol in ('openai', 'anthropic', 'responses'):
+                    for stream in (False, True):
+                        with self.subTest(accounts=account_count, protocol=protocol, stream=stream):
+                            server._gateway_cooldowns.clear()
+                            self.requests.clear()
+                            self.routing_states.clear()
+                            self.failures = [(429, b'{"error":"rate limited"}', 'application/json')] * 3
+                            started = time.time()
+                            if account_count == 1:
+                                with self.assertRaises(HTTPError) as error:
+                                    self.call(protocol, stream)
+                                self.assertEqual(error.exception.code, 503)
+                                error.exception.close()
+                            else:
+                                with self.call(protocol, stream) as response:
+                                    self.assertEqual(response.status, 200)
+                                    response.read()
+                            self.assertEqual(len(self.requests), 3 if account_count == 1 else 4)
+                            ids = [state['activeRequests'][0]['accountId'] for state, _ in self.routing_states]
+                            self.assertEqual(ids[:3], ['first'] * 3)
+                            self.assertTrue(all(not cooldowns for _, cooldowns in self.routing_states[:3]))
+                            self.assertGreaterEqual(server._gateway_cooldowns['first'], started + 60)
+                            self.assertLessEqual(server._gateway_cooldowns['first'], time.time() + 60)
+                            self.assertNotIn('second', server._gateway_cooldowns)
+                            if account_count == 2:
+                                self.assertEqual(ids[3], 'second')
+                                self.assertIn('first', self.routing_states[3][1])
+                            self.wait_active(0)
 
     def test_stream_connection_failure_retries_without_leaking_active_requests(self):
         accounts = {'first': {'apiKey': 'test-only'}, 'second': {'apiKey': 'test-only'}}

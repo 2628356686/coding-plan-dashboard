@@ -195,7 +195,7 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
             <div class="field"><label>启用网关</label><select id="gwEnabled"><option value="true">启用</option><option value="false">停用</option></select></div>
             <div class="field"><label>网关 API Key（对外认证）</label><div style="display:flex;gap:8px"><input id="gwApiKey" type="password" placeholder="sk-gateway-xxx" autocomplete="off" style="flex:1"><button type="button" class="btn" style="padding:8px 12px;white-space:nowrap" onclick="gwToggleKey()" id="gwKeyToggleBtn">显示</button><button type="button" class="btn" style="padding:8px 12px;white-space:nowrap" onclick="gwCopyKey()">复制</button><button type="button" class="btn" style="padding:8px 12px;white-space:nowrap" onclick="gwGenerateKey()">生成</button></div></div>
             <div class="field"><label>默认模型</label><input id="gwDefaultModel" type="text" placeholder="如 doubao-1-5-pro-32k"></div>
-            <div class="field"><label>最大重试次数</label><input id="gwMaxRetries" type="number" min="1" max="10" value="3"></div>
+            <div class="field"><label title="包含首次请求；全部失败后冷却 60 秒，再尝试其他账号">单账号最大尝试次数</label><input id="gwMaxRetries" type="number" min="1" max="10" value="3"></div>
             <div class="field"><label>服务端口</label><input id="gwPort" type="number" min="1" max="65535" placeholder="跟随 PORT 环境变量"><p class="hint">面板和网关共用该端口，保存后立即切换监听端口并持久化，浏览器会自动跳转到新地址；留空表示跟随 PORT 环境变量（当前监听 <span id="gwPortCurrent">…</span>）</p></div>
           </div>
         </div>

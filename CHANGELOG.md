@@ -47,6 +47,8 @@ adheres to [Semantic Versioning](https://semver.org/).
   the dashboard silently cleared the stored API key.
 
 ### Fixed
+- Gateway retries the same account up to `maxRetries` total attempts before a
+  60-second cooldown and failover; the concurrency slot stays reserved across retries.
 - Dashboard quotas now auto-refresh every 60 seconds and immediately when the
   tab becomes visible again, instead of requiring a manual refresh; overlapping
   refresh requests are skipped.

@@ -2234,7 +2234,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         accounts = load_requests(self.requests_path)
         snapshot = load_snapshot(self.snapshot_path)
-        max_retries = int(config.get("maxRetries", 3))
+        max_retries = max(1, min(10, int(config.get("maxRetries", 3))))
         stream = bool(body.get("stream", False))
         model = body.get("model") or config.get("defaultModel", "")
         last_error = ""
@@ -2242,7 +2242,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         log.info("gw request %s model=%s stream=%s protocol=%s platform=%s",
                  self.path, model or "-", stream, inbound_format, platform or "-")
 
-        for _attempt in range(max_retries):
+        for _account_attempt in range(max(1, len(accounts))):
             with reserve_gateway_account(accounts, snapshot, model, inbound_format, stream, platform) as (aid, acc):
                 if not aid:
                     d = self._gateway_diagnostics(accounts)
@@ -2306,107 +2306,116 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 upstream_body["stream"] = native_stream or responses_stream
                 upstream_bytes = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
 
-                # True SSE streaming: bypass buffering, stream directly
-                if native_stream or responses_stream:
-                    record_gateway_request(aid, platform)
-                    try:
-                        self._gateway_stream_openai(base_url, upstream_path, upstream_key, upstream_bytes,
-                                                    upstream_protocol, inbound_format, model, tool_context)
-                    except GatewayRetry as error:
-                        cooldown_account(aid, reason=str(error))
-                        last_error = str(error)
-                        continue
-                    log.info("gw stream complete via %s in %.1fs", aid, time.monotonic() - started)
-                    return
-
-                status, resp, err = gateway_send_upstream(
-                    base_url, upstream_path, upstream_key, upstream_bytes,
-                    protocol=upstream_protocol,
-                )
-                if resp is None:
-                    last_error = err or "upstream connection failed"
-                    cooldown_account(aid, 30, last_error)
-                    continue
-
-                try:
-                    resp_body = resp.read()
-                except (OSError, HTTPException):
-                    cooldown_account(aid, 30, "upstream response interrupted")
-                    last_error = "upstream response interrupted"
-                    continue
-                finally:
-                    resp.close()
-                resp_text = resp_body.decode("utf-8", errors="replace")
-
-                if status != 200:
-                    if is_quota_exhausted(status, resp_text):
-                        log.warning("gw account %s upstream HTTP %d quota-like: %.200s", aid, status, resp_text)
-                        cooldown_account(aid, reason="upstream HTTP %d quota-like" % status)
-                        last_error = "account %s quota exhausted (HTTP %d)" % (aid, status)
-                        continue
-                    log.info("gw upstream HTTP %d passthrough (account %s)", status, aid)
-                    self.send_response(status)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Content-Length", str(len(resp_body)))
-                    self.end_headers()
-                    self.wfile.write(resp_body)
-                    return
-
-                record_gateway_request(aid, platform)
-
-                # ---- Response conversion: upstream -> inbound protocol ----
-                try:
-                    upstream_json = json.loads(resp_text)
-                except json.JSONDecodeError:
-                    upstream_json = None
-                if not isinstance(upstream_json, dict) or upstream_json.get("error"):
-                    self._gateway_write_json(502, {"error": {"message": "upstream returned an invalid model response"}})
-                    return
-
-                out_model = model or upstream_body.get("model", "")
-                if upstream_protocol == inbound_format:
-                    out_bytes = resp_body
-                elif upstream_protocol == "openai" and inbound_format == "anthropic":
-                    out = openai_to_anthropic(upstream_json, out_model) if isinstance(upstream_json, dict) else None
-                    out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
-                elif upstream_protocol == "openai" and inbound_format == "responses":
-                    try:
-                        out = openai_to_responses(upstream_json, out_model, tool_context) if isinstance(upstream_json, dict) else None
-                    except (ValueError, TypeError, KeyError):
-                        self._gateway_write_json(502, {"error": {"message": "invalid upstream tool call"}})
-                        return
-                    out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
-                elif upstream_protocol == "anthropic" and inbound_format == "openai":
-                    out = anthropic_response_to_openai(upstream_json, out_model) if isinstance(upstream_json, dict) else None
-                    out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
-                elif upstream_protocol == "anthropic" and inbound_format == "responses":
-                    if isinstance(upstream_json, dict):
-                        oa = anthropic_response_to_openai(upstream_json, out_model)
+                # Keep the same account and concurrency reservation across retries.
+                for attempt in range(max_retries):
+                    # True SSE streaming: bypass buffering, stream directly
+                    if native_stream or responses_stream:
+                        record_gateway_request(aid, platform)
                         try:
-                            out = openai_to_responses(oa, out_model, tool_context)
+                            self._gateway_stream_openai(base_url, upstream_path, upstream_key, upstream_bytes,
+                                                        upstream_protocol, inbound_format, model, tool_context)
+                        except GatewayRetry as error:
+                            self._gateway_retry_account(aid, attempt, max_retries, str(error))
+                            last_error = str(error)
+                            continue
+                        log.info("gw stream complete via %s in %.1fs", aid, time.monotonic() - started)
+                        return
+
+                    status, resp, err = gateway_send_upstream(
+                        base_url, upstream_path, upstream_key, upstream_bytes,
+                        protocol=upstream_protocol,
+                    )
+                    if resp is None:
+                        last_error = err or "upstream connection failed"
+                        self._gateway_retry_account(aid, attempt, max_retries, last_error)
+                        continue
+
+                    try:
+                        resp_body = resp.read()
+                    except (OSError, HTTPException):
+                        self._gateway_retry_account(aid, attempt, max_retries, "upstream response interrupted")
+                        last_error = "upstream response interrupted"
+                        continue
+                    finally:
+                        resp.close()
+                    resp_text = resp_body.decode("utf-8", errors="replace")
+
+                    if status != 200:
+                        if is_quota_exhausted(status, resp_text):
+                            log.warning("gw account %s upstream HTTP %d quota-like: %.200s", aid, status, resp_text)
+                            self._gateway_retry_account(aid, attempt, max_retries, "upstream HTTP %d quota-like" % status)
+                            last_error = "account %s quota exhausted (HTTP %d)" % (aid, status)
+                            continue
+                        log.info("gw upstream HTTP %d passthrough (account %s)", status, aid)
+                        self.send_response(status)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(resp_body)))
+                        self.end_headers()
+                        self.wfile.write(resp_body)
+                        return
+
+                    record_gateway_request(aid, platform)
+
+                    # ---- Response conversion: upstream -> inbound protocol ----
+                    try:
+                        upstream_json = json.loads(resp_text)
+                    except json.JSONDecodeError:
+                        upstream_json = None
+                    if not isinstance(upstream_json, dict) or upstream_json.get("error"):
+                        self._gateway_write_json(502, {"error": {"message": "upstream returned an invalid model response"}})
+                        return
+
+                    out_model = model or upstream_body.get("model", "")
+                    if upstream_protocol == inbound_format:
+                        out_bytes = resp_body
+                    elif upstream_protocol == "openai" and inbound_format == "anthropic":
+                        out = openai_to_anthropic(upstream_json, out_model) if isinstance(upstream_json, dict) else None
+                        out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
+                    elif upstream_protocol == "openai" and inbound_format == "responses":
+                        try:
+                            out = openai_to_responses(upstream_json, out_model, tool_context) if isinstance(upstream_json, dict) else None
                         except (ValueError, TypeError, KeyError):
                             self._gateway_write_json(502, {"error": {"message": "invalid upstream tool call"}})
                             return
-                        out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8")
+                        out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
+                    elif upstream_protocol == "anthropic" and inbound_format == "openai":
+                        out = anthropic_response_to_openai(upstream_json, out_model) if isinstance(upstream_json, dict) else None
+                        out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
+                    elif upstream_protocol == "anthropic" and inbound_format == "responses":
+                        if isinstance(upstream_json, dict):
+                            oa = anthropic_response_to_openai(upstream_json, out_model)
+                            try:
+                                out = openai_to_responses(oa, out_model, tool_context)
+                            except (ValueError, TypeError, KeyError):
+                                self._gateway_write_json(502, {"error": {"message": "invalid upstream tool call"}})
+                                return
+                            out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8")
+                        else:
+                            out_bytes = resp_body
+                    elif upstream_protocol == "anthropic" and inbound_format == "anthropic":
+                        out_bytes = resp_body
                     else:
                         out_bytes = resp_body
-                elif upstream_protocol == "anthropic" and inbound_format == "anthropic":
-                    out_bytes = resp_body
-                else:
-                    out_bytes = resp_body
 
-                if stream:
-                    out_bytes = gateway_message_events(json.loads(out_bytes), inbound_format)
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8" if stream else "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(out_bytes)))
-                self.end_headers()
-                self.wfile.write(out_bytes)
-                log.info("gw request complete via %s (upstream %s) in %.1fs",
-                         aid, upstream_protocol, time.monotonic() - started)
-                return
+                    if stream:
+                        out_bytes = gateway_message_events(json.loads(out_bytes), inbound_format)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8" if stream else "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(out_bytes)))
+                    self.end_headers()
+                    self.wfile.write(out_bytes)
+                    log.info("gw request complete via %s (upstream %s) in %.1fs",
+                             aid, upstream_protocol, time.monotonic() - started)
+                    return
 
         self.send_error(503, "all gateway accounts exhausted: " + last_error)
+
+    def _gateway_retry_account(self, aid, attempt, max_attempts, reason):
+        if attempt + 1 >= max_attempts:
+            cooldown_account(aid, GATEWAY_COOLDOWN_SECONDS, reason)
+        else:
+            log.warning("gw account %s retry same account attempt %d/%d: %s",
+                        aid, attempt + 2, max_attempts, reason)
 
     def _gateway_diagnostics(self, accounts):
         """Count why accounts are not eligible for gateway routing."""
