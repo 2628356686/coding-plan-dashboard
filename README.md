@@ -32,6 +32,12 @@ AgentPlan、Kimi Code、LongCat、千问 AI 和 Google AI (Gemini 3.5 Flash)。�
   when a NewAPI variant is configured.
 - All progress bars show one-decimal usage percentage; each card shows a live
   countdown to the next reset in the top-right corner.
+- SMS verification (接码) management page: rent numbers and query codes from
+  号码盾 (smsnex) and EOMSG 易码, including first/second verification codes and
+  number release. Platform API keys are stored server-side in `data/sms.json`
+  and only shown masked in the UI. / 接码管理页面：从号码盾、EOMSG 取号并查询
+  首次/二次验证码，支持释放号码；平台 Key 仅保存在服务端 `data/sms.json`，页面
+  只显示掩码。
 - Self-contained single-file browser UI (`index.html`) with a custom SVG logo and no
   external favicon dependency.
 

@@ -112,6 +112,7 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
       <a class="active" onclick="switchPage('dashboard',this)"><span class="icon">📊</span>仪表盘</a>
       <a onclick="switchPage('accounts',this)"><span class="icon">👤</span>账号管理</a>
       <a onclick="switchPage('gateway',this)"><span class="icon">🌐</span>网关管理</a>
+      <a onclick="switchPage('sms',this)"><span class="icon">📱</span>接码管理</a>
     </nav>
   </aside>
   <div class="main-content">
@@ -203,6 +204,46 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
             <div class="field"><label>Agent Plan · OpenAI 地址</label><input id="gwAgentOpenaiUrl" type="text" placeholder="https://ark.cn-beijing.volces.com/api/plan/v3"></div>
             <div class="field"><label>Coding Plan · Anthropic 地址</label><input id="gwCodingAnthropicUrl" type="text" placeholder="https://ark.cn-beijing.volces.com/api/coding"></div>
             <div class="field"><label>Coding Plan · OpenAI 地址</label><input id="gwCodingOpenaiUrl" type="text" placeholder="https://ark.cn-beijing.volces.com/api/coding/v3"></div>
+          </div>
+        </div>
+      </section>
+      <section id="page-sms" class="page">
+        <div class="page-header">
+          <div><h2>接码管理</h2><p>选择接码平台，按平台支持的条件取号并查询验证码</p></div>
+        </div>
+        <div class="panel" style="margin-bottom:18px">
+          <h3>平台状态</h3>
+          <p class="hint">配置接码平台的地址与 API Key。Key 仅保存在服务端 data 目录，页面只显示前 8 位</p>
+          <div class="accounts-table-wrap">
+            <table class="accounts-table">
+              <thead><tr><th>平台</th><th>地址</th><th>API Key</th><th>状态</th><th>操作</th></tr></thead>
+              <tbody id="smsPlatformTbody"><tr><td colspan="5" style="text-align:center;color:var(--muted)">加载中…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="panel" style="margin-bottom:18px">
+          <h3>取号</h3>
+          <p class="hint" id="smsAccountHint">选择平台后自动读取账户余额</p>
+          <div class="source-body">
+            <div class="field"><label>平台</label><select id="smsPlatform"><option value="smsnex">号码盾</option><option value="eomsg">EOMSG 易码</option></select></div>
+            <div class="field"><label>项目关键词</label><div style="display:flex;gap:8px"><input id="smsSearch" placeholder="输入项目名称，如 Telegram 或 智谱AI" style="flex:1"><button type="button" class="btn" style="white-space:nowrap" onclick="smsLoadProjects()">搜索项目</button></div></div>
+            <div class="field"><label>项目</label><select id="smsProject"><option value="">先搜索项目</option></select></div>
+            <div class="field"><label>通道（价格从低到高）</label><select id="smsChannel"><option value="">先选项目</option></select></div>
+            <div id="smsEomsgOptions" style="display:none">
+              <div class="field"><label>卡类型</label><select id="smsCardType"><option value="全部">全部</option><option value="实卡">实卡</option><option value="虚卡">虚卡</option></select></div>
+              <div class="field"><label>归属地</label><input id="smsProvince" placeholder="留空为全部归属地"></div>
+            </div>
+            <button type="button" class="btn primary" id="smsRentBtn" onclick="smsRent()">取号</button>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>当前号码 <span class="badge" id="smsPhoneCount">0</span></h3>
+          <p class="hint">号码列表仅保存在当前浏览器会话。首次验证码到达后，可在同一号码上查询二次验证码（EOMSG 直接复用号码，号码盾会对同一号码重新取号）</p>
+          <div class="accounts-table-wrap">
+            <table class="accounts-table">
+              <thead><tr><th>ID</th><th>手机号</th><th>项目</th><th>价格</th><th>状态</th><th>首次验证码</th><th>二次验证码</th><th>短信内容</th><th>到期时间</th><th>操作</th></tr></thead>
+              <tbody id="smsPhoneTbody"><tr><td colspan="10" style="text-align:center;color:var(--muted)">暂无号码，请在上方取号。</td></tr></tbody>
+            </table>
           </div>
         </div>
       </section>
@@ -355,6 +396,7 @@ function switchPage(pageId, el){
   if(pageId==='accounts') renderAccountsTable();
   gwStopActivePolling();
   if(pageId==='gateway'){gwLoadConfig();gwPollActive();}
+  if(pageId==='sms'){smsLoadPage();}
 }
 function copyText(text, btn){
   if(!text) return;
@@ -596,7 +638,205 @@ async function gwSaveConfig(){
   }catch(e){alert('保存失败：'+e.message);}
 }
 
+// ---- SMS 接码管理 ----
+const smsState={platforms:[],projects:[],phones:[],providerRestored:false};
+let smsAccountSeq=0,smsProjectSeq=0;
+function smsProvider(){return document.getElementById('smsPlatform').value||'smsnex';}
+async function smsFetch(url,options){
+  const r=await fetch(url,options);
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error((j&&typeof j.error==='string')?j.error:(j&&j.error&&j.error.message)||('HTTP '+r.status));
+  return j;
+}
+function smsUpdateMode(){document.getElementById('smsEomsgOptions').style.display=smsProvider()==='eomsg'?'block':'none';}
+function smsLoadPage(){
+  smsLoadPlatforms().then(()=>{
+    const p=smsState.platforms.find(x=>x.id===smsProvider());
+    if(p&&p.enabled&&p.configured){smsLoadAccount();smsLoadProjects(true);}
+    else if(p){document.getElementById('smsAccountHint').textContent='请先配置并启用 '+p.name;}
+  });
+  smsRenderPhones();
+}
+async function smsLoadPlatforms(){
+  const j=await smsFetch('/api/sms/platform');
+  smsState.platforms=j.platforms||[];
+  document.getElementById('smsPlatformTbody').innerHTML=smsState.platforms.map(p=>'<tr><td>'+escapeHtml(p.name)+'</td><td style="color:var(--muted)">'+escapeHtml(p.origin)+'</td><td style="color:var(--muted)">'+(p.configured?escapeHtml(p.keyPreview):'未配置')+'</td><td>'+(p.enabled?'<span style="color:var(--good)">已启用</span>':'<span style="color:var(--muted)">停用</span>')+'</td><td><button class="btn" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="smsOpenConfig(\''+p.id+'\')">配置</button><a class="btn" style="padding:4px 10px;font-size:12px" href="'+escapeHtml(p.consoleUrl)+'" target="_blank" rel="noopener">控制台</a></td></tr>').join('');
+  if(!smsState.providerRestored){
+    const saved=localStorage.getItem('zcodeSmsProvider');
+    if(saved&&smsState.platforms.some(p=>p.id===saved))document.getElementById('smsPlatform').value=saved;
+    smsState.providerRestored=true;
+    smsUpdateMode();
+  }
+}
+async function smsLoadAccount(){
+  const seq=++smsAccountSeq,provider=smsProvider(),el=document.getElementById('smsAccountHint');
+  el.textContent='正在读取 '+(provider==='eomsg'?'EOMSG':'号码盾')+' 余额…';
+  try{
+    const j=await smsFetch('/api/sms/account?provider='+encodeURIComponent(provider));
+    if(seq!==smsAccountSeq||provider!==smsProvider())return;
+    el.textContent='余额 ¥'+(j.balance!=null?j.balance:'—')+' · 账号 '+(j.username||'—');
+  }catch(e){
+    if(seq===smsAccountSeq&&provider===smsProvider())el.textContent='余额读取失败：'+e.message;
+  }
+}
+async function smsLoadProjects(isDefault){
+  const seq=++smsProjectSeq,sel=document.getElementById('smsProject'),search=document.getElementById('smsSearch');
+  if(isDefault&&!search.value.trim())search.value='智谱AI';
+  const name=search.value.trim();
+  sel.innerHTML='<option value="">加载中…</option>';
+  try{
+    const j=await smsFetch('/api/sms/projects?provider='+encodeURIComponent(smsProvider())+'&platform=domestic&page=1&name='+encodeURIComponent(name));
+    if(seq!==smsProjectSeq)return;
+    smsState.projects=j.list||[];
+    sel.innerHTML=smsState.projects.length?smsState.projects.map(p=>'<option value="'+escapeHtml(String(p.id))+'">'+escapeHtml(p.name||String(p.id))+'</option>').join(''):'<option value="">无可用项目</option>';
+    const def=smsState.projects.find(p=>p.name===name)||smsState.projects[0];
+    if(def){sel.value=String(def.id);smsLoadChannels();}
+    else document.getElementById('smsChannel').innerHTML='<option value="">先选项目</option>';
+  }catch(e){
+    if(seq===smsProjectSeq)sel.innerHTML='<option value="">加载失败</option>';
+  }
+}
+async function smsLoadChannels(){
+  const projectId=document.getElementById('smsProject').value,sel=document.getElementById('smsChannel');
+  if(!projectId){sel.innerHTML='<option value="">先选项目</option>';return;}
+  sel.innerHTML='<option value="">加载中…</option>';
+  const project=smsState.projects.find(p=>String(p.id)===String(projectId));
+  try{
+    const j=await smsFetch('/api/sms/channels?provider='+encodeURIComponent(smsProvider())+'&projectId='+encodeURIComponent(projectId)+'&platform='+encodeURIComponent(project&&project.platform||'domestic'));
+    const channels=j.list||[];
+    sel.innerHTML=channels.length?channels.map(c=>'<option value="'+escapeHtml(String(c.uid))+'">'+escapeHtml(c.name||String(c.uid))+(c.price!=null?' · ¥'+Number(c.price).toFixed(2)+(c.availableNumber!=null?' · 剩'+c.availableNumber:''):'')+'</option>').join(''):'<option value="">无可用通道</option>';
+  }catch(e){sel.innerHTML='<option value="">通道加载失败</option>';}
+}
+async function smsRent(){
+  const projectId=document.getElementById('smsProject').value,chUid=document.getElementById('smsChannel').value;
+  if(!projectId||!chUid){alert('请先选择项目和通道');return;}
+  const btn=document.getElementById('smsRentBtn');
+  btn.disabled=true;btn.textContent='取号中…';
+  const project=smsState.projects.find(p=>String(p.id)===String(projectId));
+  try{
+    const j=await smsFetch('/api/sms/rent?provider='+encodeURIComponent(smsProvider()),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({projectId,platform:project&&project.platform||'domestic',channelUid:chUid,cardType:document.getElementById('smsCardType').value,province:document.getElementById('smsProvince').value.trim()})});
+    smsState.phones.push(Object.assign({},j,{_uiStatus:'等待验证码',_uiCode:'',_uiSms:'',_projectId:projectId,_channelUid:chUid,_platform:project&&project.platform||'domestic',_provider:smsProvider()}));
+    smsRenderPhones();
+    smsPollCode(smsState.phones.length-1);
+  }catch(e){alert('取号失败：'+e.message);}
+  finally{btn.disabled=false;btn.textContent='取号';}
+}
+function smsTime(ts){return ts?new Date(ts*1000).toLocaleString():'—';}
+function smsRenderPhones(){
+  document.getElementById('smsPhoneCount').textContent=smsState.phones.length;
+  const body=document.getElementById('smsPhoneTbody');
+  if(!smsState.phones.length){body.innerHTML='<tr><td colspan="10" style="text-align:center;color:var(--muted)">暂无号码，请在上方取号。</td></tr>';return;}
+  body.innerHTML=smsState.phones.map((ph,idx)=>{
+    const sms=[ph._uiSms,ph._secondSms].filter(Boolean).join(' / ')||'—';
+    const secondLabel=ph._secondPolling?'二次查码中…':(ph._secondRenting?'指定接码中…':(ph._secondCode?'二次码已收到':'查二次码'));
+    const secondDisabled=!ph._uiCode||!!ph._secondCode||!!ph._secondRenting||!!ph._secondPolling;
+    return '<tr><td>'+escapeHtml(String(ph.id))+'</td><td>'+escapeHtml(String(ph.phone))+'</td><td>'+escapeHtml(ph.projectName||'—')+'</td><td>'+(ph.price!=null?'¥'+Number(ph.price).toFixed(2):'固定收费')+'</td><td>'+escapeHtml(ph._uiStatus||ph.status||'pending')+'</td><td>'+escapeHtml(ph._uiCode||'—')+'</td><td>'+escapeHtml(ph._secondCode||ph._secondStatus||'—')+'</td><td style="max-width:260px;word-break:break-all">'+escapeHtml(sms)+'</td><td style="color:var(--muted)">'+smsTime(ph._secondExpiresAt||ph.expiresAt)+'</td><td style="white-space:nowrap"><button class="btn" style="padding:4px 10px;font-size:12px" '+(ph._uiCode?'disabled':'')+' onclick="smsPollCode('+idx+')">查码</button><button class="btn" style="padding:4px 10px;font-size:12px;margin-left:6px" '+(secondDisabled?'disabled':'')+' onclick="smsSecondCode('+idx+')">'+secondLabel+'</button><button class="btn" style="padding:4px 10px;font-size:12px;margin-left:6px" onclick="smsRelease('+idx+')">释放</button></td></tr>';
+  }).join('');
+}
+async function smsPollCode(idx){
+  const ph=smsState.phones[idx];
+  if(!ph||ph._polling)return;
+  ph._polling=true;ph._uiStatus='轮询中…';smsRenderPhones();
+  ph._controller=new AbortController();
+  try{
+    const j=await smsFetch('/api/sms/poll/'+encodeURIComponent(ph.id)+'?provider='+encodeURIComponent(ph._provider||'smsnex')+'&keyWord='+encodeURIComponent(ph._projectId||''),{signal:ph._controller.signal});
+    if(j.status==='success'&&j.code){ph._uiCode=j.code;ph._uiSms=j.sms||'';ph._uiStatus='已收到';}
+    else if(j.status==='timeout')ph._uiStatus='等待超时';
+    else ph._uiStatus='等待验证码';
+  }catch(e){
+    if(e.name!=='AbortError'){ph._uiStatus='查询失败';alert('查码失败：'+e.message);}
+  }
+  finally{ph._polling=false;smsRenderPhones();}
+}
+async function smsSecondCode(idx){
+  const ph=smsState.phones[idx];
+  if(!ph||!ph._uiCode||ph._secondCode||ph._secondRenting||ph._secondPolling)return;
+  if(ph._provider==='eomsg'){ph._secondId=ph.id;smsPollSecond(idx);}
+  else smsSecondRent(idx);
+}
+async function smsSecondRent(idx){
+  const ph=smsState.phones[idx];
+  ph._secondRenting=true;ph._secondStatus='指定接码中…';smsRenderPhones();
+  try{
+    const j=await smsFetch('/api/sms/rent?provider='+encodeURIComponent(ph._provider||'smsnex'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({projectId:ph._projectId,platform:ph._platform||'domestic',channelUid:ph._channelUid,phone:ph.phone})});
+    ph._secondId=j.id;ph._secondExpiresAt=j.expiresAt;ph._secondStatus='等待二次验证码';
+    smsPollSecond(idx);
+  }catch(e){ph._secondStatus='指定接码失败';alert('指定接码失败：'+e.message);}
+  finally{ph._secondRenting=false;smsRenderPhones();}
+}
+async function smsPollSecond(idx){
+  const ph=smsState.phones[idx];
+  if(ph._provider==='eomsg')ph._secondId=ph.id;
+  if(!ph||!ph._secondId||ph._secondPolling)return;
+  ph._secondPolling=true;ph._secondStatus='二次查码中…';smsRenderPhones();
+  ph._secondController=new AbortController();
+  try{
+    const j=await smsFetch('/api/sms/poll/'+encodeURIComponent(ph._secondId)+'?provider='+encodeURIComponent(ph._provider||'smsnex')+'&keyWord='+encodeURIComponent(ph._projectId||'')+'&previousSms='+encodeURIComponent(ph._provider==='eomsg'?(ph._uiSms||''):''),{signal:ph._secondController.signal});
+    if(j.status==='success'&&j.code){ph._secondCode=j.code;ph._secondSms=j.sms||'';ph._secondStatus='';ph._uiStatus='二次验证码已收到';}
+    else if(j.status==='timeout'){ph._secondStatus='二次等待超时';ph._uiStatus='二次等待超时';}
+    else{ph._secondStatus='等待二次验证码';ph._uiStatus='等待二次验证码';}
+  }catch(e){
+    if(e.name!=='AbortError'){ph._secondStatus='二次查询失败';ph._uiStatus='二次查询失败';alert('二次查码失败：'+e.message);}
+  }
+  finally{ph._secondPolling=false;smsRenderPhones();}
+}
+async function smsRelease(idx){
+  const ph=smsState.phones[idx];
+  if(!ph)return;
+  try{
+    await smsFetch('/api/sms/release/'+encodeURIComponent(ph.id)+'?provider='+encodeURIComponent(ph._provider||'smsnex'),{method:'POST'});
+    if(ph._controller)ph._controller.abort();
+    if(ph._secondController)ph._secondController.abort();
+    smsState.phones=smsState.phones.filter(item=>item!==ph);
+    smsRenderPhones();
+  }catch(e){alert('释放失败：'+e.message);}
+}
+function smsOpenConfig(id){
+  const p=smsState.platforms.find(x=>x.id===id);
+  if(!p)return;
+  const modal=document.getElementById('smsConfigModal');
+  modal.dataset.provider=id;
+  document.getElementById('smsConfigProvider').value=p.name+' ('+p.id+')';
+  document.getElementById('smsConfigOrigin').value=p.origin;
+  document.getElementById('smsConfigKey').value='';
+  document.getElementById('smsConfigKeyHint').textContent=p.configured?'已保存 Key：'+p.keyPreview:'尚未配置 Key';
+  document.getElementById('smsConfigEnabled').checked=!!p.enabled;
+  document.getElementById('smsConfigClearKey').checked=false;
+  modal.classList.remove('hidden');
+}
+function smsCloseConfig(){document.getElementById('smsConfigModal').classList.add('hidden');}
+async function smsSaveConfig(){
+  const modal=document.getElementById('smsConfigModal');
+  try{
+    await smsFetch('/api/sms/platform',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:modal.dataset.provider,origin:document.getElementById('smsConfigOrigin').value.trim(),apiKey:document.getElementById('smsConfigKey').value.trim(),enabled:document.getElementById('smsConfigEnabled').checked,clearApiKey:document.getElementById('smsConfigClearKey').checked})});
+    smsCloseConfig();
+    smsLoadPlatforms();
+  }catch(e){alert('保存失败：'+e.message);}
+}
+document.getElementById('smsPlatform').onchange=function(){
+  localStorage.setItem('zcodeSmsProvider',this.value);
+  smsState.projects=[];
+  smsUpdateMode();
+  smsLoadPage();
+};
+document.getElementById('smsProject').onchange=smsLoadChannels;
+
 </script>
+
+<div id="smsConfigModal" class="modal hidden">
+  <div class="modal-content">
+    <h3>配置接码平台</h3>
+    <div class="field"><label>平台</label><input id="smsConfigProvider" type="text" readonly></div>
+    <div class="field"><label>平台地址</label><input id="smsConfigOrigin" type="url" placeholder="https://www.smsnex.com"></div>
+    <div class="field"><label>API Key</label><input id="smsConfigKey" type="password" autocomplete="new-password" placeholder="留空表示保留现有 Key"><p class="hint" id="smsConfigKeyHint"></p></div>
+    <div class="field"><label><input type="checkbox" id="smsConfigEnabled"> 启用平台</label></div>
+    <div class="field"><label><input type="checkbox" id="smsConfigClearKey"> 清除已保存的 Key</label></div>
+    <div class="actions">
+      <button class="btn" onclick="smsCloseConfig()">取消</button>
+      <button class="btn primary" onclick="smsSaveConfig()">保存</button>
+    </div>
+  </div>
+</div>
 
 <div id="editAccountModal" class="modal hidden">
   <div class="modal-content">

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from http.client import HTTPException
 from pathlib import Path
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
@@ -1228,6 +1228,151 @@ def is_quota_exhausted(status, body_text):
     ))
 
 
+# ============================================================================
+# SMS verification platforms proxy (号码盾 smsnex + EOMSG 易码)
+# ============================================================================
+
+SMS_CONFIG_PATH = Path(os.environ.get("SMS_CONFIG_PATH", "/data/sms.json"))
+EOMSG_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "Chrome/140 Safari/537.36")
+
+
+class SmsError(Exception):
+    """Validation or upstream failure carrying an HTTP status for the API."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def load_sms_config():
+    default = {
+        "smsnex": {"enabled": False, "origin": "https://www.smsnex.com",
+                   "apiKey": "", "pollIntervalMs": 3000, "maxWaitMs": 300000},
+        "eomsg": {"enabled": False, "origin": "https://api.eomsg.com/zc/data.php",
+                  "apiKey": "", "pollIntervalMs": 3000, "maxWaitMs": 300000},
+    }
+    try:
+        data = json.loads(SMS_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+    if not isinstance(data, dict):
+        return default
+    for provider, cfg in default.items():
+        stored = data.get(provider)
+        if isinstance(stored, dict):
+            cfg.update({k: v for k, v in stored.items() if k in cfg})
+    return default
+
+
+def save_sms_config(config):
+    save_snapshot(str(SMS_CONFIG_PATH), config)
+
+
+def sms_normalize(value):
+    """Recursively convert snake_case keys to camelCase (smsnex protocol)."""
+    if isinstance(value, list):
+        return [sms_normalize(item) for item in value]
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            parts = key.split("_")
+            name = parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:] if p)
+            result[name] = sms_normalize(item)
+        return result
+    return value
+
+
+def sms_verification_code(message):
+    """Extract the longest 4-8 digit run from an SMS body, if any."""
+    parts = [part for part in re.split(r"\D", message) if 4 <= len(part) <= 8]
+    return max(parts, key=len) if parts else None
+
+
+_sms_code_gate = {"next": 0.0}
+_sms_code_lock = RLock()
+
+
+def smsnex_upstream(cfg, method, path, query=None, body=None):
+    if path.endswith("/code"):
+        # smsnex rejects tighter /code polling; keep a global minimum interval.
+        with _sms_code_lock:
+            wait = _sms_code_gate["next"] - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            _sms_code_gate["next"] = time.time() + max(cfg.get("pollIntervalMs", 3000), 2100) / 1000.0
+    url = cfg["origin"].rstrip("/") + "/openapi/v1" + path
+    if query:
+        url += "?" + urlencode(query)
+    request = Request(url, method=method, headers={"Authorization": "Bearer " + cfg["apiKey"]})
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urlopen(request, data=data, timeout=30) as response:
+            status = response.status
+            raw = response.read().decode("utf-8")
+    except HTTPError as error:
+        message = "接码平台请求失败"
+        try:
+            payload = json.loads(error.read().decode("utf-8"))
+            if isinstance(payload.get("message"), str) and payload["message"]:
+                message = payload["message"]
+        except (ValueError, OSError):
+            pass
+        raise SmsError(error.code, message) from None
+    except (URLError, TimeoutError, OSError):
+        raise SmsError(502, "接码平台连接失败") from None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        raise SmsError(502, "接码平台返回了无效数据") from None
+    if not (200 <= status < 300) or payload.get("code") != 0:
+        message = payload.get("message")
+        if not isinstance(message, str) or not message:
+            message = "接码平台请求失败"
+        raise SmsError(status if not (200 <= status < 300) else 502, message)
+    return sms_normalize(payload.get("data"))
+
+
+def eomsg_upstream(cfg, code, params=()):
+    url = cfg["origin"] + ("&" if "?" in cfg["origin"] else "?") + urlencode(
+        [("code", code), ("token", cfg["apiKey"])] + list(params))
+    retryable = code in ("leftAmount", "getMsg", "queryUsed")
+    for attempt in range(3):
+        try:
+            request = Request(url, headers={
+                "User-Agent": EOMSG_UA,
+                "Accept": "text/plain, */*",
+                "Referer": "https://www.eomsg.com/",
+            })
+            with urlopen(request, timeout=30) as response:
+                status = response.status
+                text = response.read().decode("utf-8", "replace").strip()
+        except HTTPError as error:
+            status = error.code
+            try:
+                text = error.read().decode("utf-8", "replace").strip()
+            except OSError:
+                text = ""
+        except (URLError, TimeoutError, OSError):
+            if retryable and attempt < 2:
+                time.sleep(0.35 * (attempt + 1))
+                continue
+            raise SmsError(502, "EOMSG 连接失败") from None
+        upper = text.upper()
+        transient = status >= 500 or "ERROR CODE: 520" in upper
+        if retryable and transient and attempt < 2:
+            time.sleep(0.35 * (attempt + 1))
+            continue
+        if not (200 <= status < 300) or upper.startswith("ERR"):
+            raise SmsError(status if not (200 <= status < 300) else 502,
+                           text or "EOMSG 请求失败")
+        return text
+    raise SmsError(502, "EOMSG 暂时不可用，请稍后重试")
+
 
 class DashboardHandler(SimpleHTTPRequestHandler):
     snapshot_path = Path(os.environ.get("SNAPSHOT_PATH", "/data/snapshot.json"))
@@ -1277,6 +1422,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/gateway/active":
             self.send_json(gateway_active_snapshot())
             return
+        if self.path.startswith("/api/sms/"):
+            self.handle_sms_request("GET")
+            return
         if self.path in ("/v1/models", "/models"):
             self.handle_gateway_models()
             return
@@ -1321,6 +1469,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.handle_gateway_config_post(payload)
             except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 self.send_error(400, str(error))
+            return
+        if self.path.startswith("/api/sms/"):
+            self.handle_sms_request("POST")
             return
         if self.path not in {"/api/snapshot", "/api/requests", "/api/refresh", "/api/order", "/api/requests/gateway"}:
             self.send_error(404)
@@ -1900,6 +2051,191 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "accounts": account_status,
         })
 
+    def _sms_read_json(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > 16384:
+            raise SmsError(400, "请求体过大")
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise SmsError(400, "请求体必须是有效 JSON") from None
+
+    def handle_sms_platform_get(self):
+        config = load_sms_config()
+        platforms = []
+        for pid, name, fixed_console in (
+                ("smsnex", "号码盾", None),
+                ("eomsg", "EOMSG 易码", "https://www.eomsg.com/appweb/t1.html")):
+            cfg = config[pid]
+            key = cfg.get("apiKey", "")
+            console_url = fixed_console or cfg["origin"].rstrip("/") + "/console/#/phone/domestic"
+            platforms.append({
+                "id": pid,
+                "name": name,
+                "origin": cfg["origin"],
+                "consoleUrl": console_url,
+                "configured": bool(key),
+                "keyPreview": (key[:8] + "…") if key else "",
+                "enabled": cfg.get("enabled", False),
+            })
+        self._gateway_write_json(200, {"platforms": platforms})
+
+    def handle_sms_platform_post(self, payload):
+        provider = payload.get("provider", "smsnex")
+        if provider not in ("smsnex", "eomsg"):
+            raise SmsError(400, "未知接码平台")
+        config = load_sms_config()
+        cfg = config[provider]
+        if isinstance(payload.get("enabled"), bool):
+            cfg["enabled"] = payload["enabled"]
+        origin = payload.get("origin")
+        if isinstance(origin, str) and origin.strip():
+            origin = origin.strip().rstrip("/")
+            parsed = urlparse(origin)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                raise SmsError(400, "平台地址必须是有效的 HTTP 或 HTTPS 地址")
+            cfg["origin"] = origin
+        if payload.get("clearApiKey") is True:
+            cfg["apiKey"] = ""
+        elif isinstance(payload.get("apiKey"), str) and payload["apiKey"].strip():
+            cfg["apiKey"] = payload["apiKey"].strip()
+        if cfg.get("enabled") and not cfg.get("apiKey"):
+            raise SmsError(400, "启用平台前请填写 API Key" +
+                           (" / Token" if provider == "eomsg" else ""))
+        save_sms_config(config)
+        self._gateway_write_json(200, {"ok": True, "platform": {
+            "id": provider, "configured": bool(cfg.get("apiKey")),
+            "enabled": cfg.get("enabled", False),
+        }})
+
+    def handle_sms_request(self, method):
+        path = self.path.split("?")[0][len("/api/sms/"):]
+        query = dict(parse_qsl(urlparse(self.path).query, keep_blank_values=True))
+        try:
+            if path == "platform":
+                if method == "POST":
+                    self.handle_sms_platform_post(self._sms_read_json())
+                else:
+                    self.handle_sms_platform_get()
+                return
+            provider = query.get("provider", "smsnex")
+            if provider not in ("smsnex", "eomsg"):
+                raise SmsError(400, "未知接码平台")
+            cfg = load_sms_config()[provider]
+            if not cfg.get("enabled") or not cfg.get("apiKey"):
+                raise SmsError(400, "请先配置并启用" + ("EOMSG" if provider == "eomsg" else "号码盾"))
+            self._gateway_write_json(200, self._sms_dispatch(provider, cfg, method, path, query))
+        except SmsError as error:
+            self._gateway_write_json(error.status, {"error": error.message})
+
+    def _sms_dispatch(self, provider, cfg, method, path, query):
+        invalid = SmsError(400, "请检查项目、通道和号码参数")
+        if path == "account":
+            if provider == "eomsg":
+                return {"balance": eomsg_upstream(cfg, "leftAmount"), "username": "EOMSG"}
+            return smsnex_upstream(cfg, "GET", "/me")
+        if path == "projects":
+            if provider == "eomsg":
+                name = query.get("name", "智谱AI").strip()
+                return {"list": [{"id": name, "name": name, "platform": "eomsg"}], "total": 1}
+            market = query.get("platform", "domestic")
+            if market not in ("domestic", "international"):
+                raise invalid
+            params = [("platform", market), ("page", query.get("page", "1")), ("size", "50")]
+            name = query.get("name", "").strip()
+            if name:
+                params.append(("name", name))
+            return smsnex_upstream(cfg, "GET", "/projects", params)
+        if path == "channels":
+            if provider == "eomsg":
+                return {"list": [{"uid": "default", "name": "固定收费", "price": None,
+                                  "availableNumber": 1}]}
+            project_id = query.get("projectId", "").strip()
+            market = query.get("platform", "domestic")
+            if not project_id or market not in ("domestic", "international"):
+                raise invalid
+            params = [("platform", market)]
+            country = query.get("country", "").strip()
+            if country:
+                params.append(("country", country))
+            value = smsnex_upstream(cfg, "GET",
+                                    "/projects/%s/channels" % quote(project_id, safe=""), params)
+            if isinstance(value.get("list"), list):
+                value["list"].sort(key=lambda c: c["price"]
+                                   if isinstance(c.get("price"), (int, float))
+                                   and not isinstance(c.get("price"), bool) else float("inf"))
+            return value
+        if path == "rent" and method == "POST":
+            body = self._sms_read_json()
+            if not isinstance(body, dict):
+                raise invalid
+            if provider == "eomsg":
+                keyword = str(body.get("projectId", "")).strip()
+                if not keyword:
+                    raise invalid
+                params = [("keyWord", keyword),
+                          ("cardType", str(body.get("cardType") or "全部"))]
+                phone = str(body.get("phone", "")).strip()
+                province = str(body.get("province", "")).strip()
+                if phone:
+                    params.append(("phone", phone))
+                if province:
+                    params.append(("province", province))
+                number = eomsg_upstream(cfg, "getPhone", params)
+                return {"id": number, "phone": number, "projectName": keyword,
+                        "price": None, "status": "pending"}
+            project_id = str(body.get("projectId", "")).strip()
+            channel = str(body.get("channelUid", "")).strip()
+            market = str(body.get("platform") or "domestic")
+            if not project_id or not channel or market not in ("domestic", "international"):
+                raise invalid
+            up_body = {"project_id": project_id, "channel_uid": channel, "platform": market}
+            country = str(body.get("country", "")).strip()
+            phone = str(body.get("phone", "")).strip()
+            if market == "international" and not country:
+                raise invalid
+            if country:
+                up_body["country"] = country
+            if phone:
+                up_body["phone"] = phone
+            return smsnex_upstream(cfg, "POST", "/phone/rent", body=up_body)
+        action, _, ident = path.partition("/")
+        ident = ident.strip()
+        if action == "release":
+            if method != "POST" or not ident:
+                raise invalid
+            if provider == "smsnex":
+                if not ident.isdigit() or int(ident) == 0:
+                    raise invalid
+                return smsnex_upstream(cfg, "POST", "/phone/%s/release" % ident, body={})
+            return {"ok": True, "result": eomsg_upstream(cfg, "release", [("phone", ident)])}
+        if action not in ("code", "poll") or method != "GET" or not ident:
+            raise invalid
+        deadline = time.time() + min(cfg.get("maxWaitMs", 300000), 300000) / 1000.0
+        interval = max(cfg.get("pollIntervalMs", 3000), 2100) / 1000.0
+        if provider == "smsnex":
+            if not ident.isdigit() or int(ident) == 0:
+                raise invalid
+            while True:
+                value = smsnex_upstream(cfg, "GET", "/phone/%s/code" % ident)
+                if action == "code" or value.get("status") != "pending":
+                    return value
+                if time.time() >= deadline:
+                    return {"status": "timeout", "code": None, "sms": None}
+                time.sleep(interval)
+        keyword = query.get("keyWord", "").strip()
+        previous = query.get("previousSms", "")
+        if not keyword:
+            raise SmsError(400, "EOMSG 查码必须提供短信关键词")
+        while True:
+            message = eomsg_upstream(cfg, "getMsg", [("phone", ident), ("keyWord", keyword)])
+            if "尚未收到" not in message and (not previous or message != previous):
+                return {"status": "success", "code": sms_verification_code(message), "sms": message}
+            if action == "code":
+                return {"status": "pending", "code": None, "sms": None}
+            if time.time() >= deadline:
+                return {"status": "timeout", "code": None, "sms": None}
+            time.sleep(interval)
 
     def send_json(self, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

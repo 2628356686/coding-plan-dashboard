@@ -18,3 +18,6 @@ adheres to [Semantic Versioning](https://semver.org/).
 - GitHub Actions CI covering `node --test` and `unittest discover`.
 - Configurable service port in the gateway settings page: rebinding takes effect
   immediately, persists in `data/gateway.json` and wins over the `PORT` env var.
+- SMS verification (接码) management page proxying 号码盾 (smsnex) and EOMSG:
+  platform config with masked keys, project/channel lookup, rent, first/second
+  code polling and release, persisted in `data/sms.json`.
