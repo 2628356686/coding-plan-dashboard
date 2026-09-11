@@ -16,3 +16,5 @@ adheres to [Semantic Versioning](https://semver.org/).
 - Import-redacted curl through a Python HTTPS re-issuer (no shell).
 - Docker Compose + Portainer Stack deployment recipes.
 - GitHub Actions CI covering `node --test` and `unittest discover`.
+- Configurable service port in the gateway settings page: rebinding takes effect
+  immediately, persists in `data/gateway.json` and wins over the `PORT` env var.

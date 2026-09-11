@@ -192,6 +192,7 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
             <div class="field"><label>网关 API Key（对外认证）</label><div style="display:flex;gap:8px"><input id="gwApiKey" type="password" placeholder="sk-gateway-xxx" autocomplete="off" style="flex:1"><button type="button" class="btn" style="padding:8px 12px;white-space:nowrap" onclick="gwToggleKey()" id="gwKeyToggleBtn">显示</button><button type="button" class="btn" style="padding:8px 12px;white-space:nowrap" onclick="gwCopyKey()">复制</button><button type="button" class="btn" style="padding:8px 12px;white-space:nowrap" onclick="gwGenerateKey()">生成</button></div></div>
             <div class="field"><label>默认模型</label><input id="gwDefaultModel" type="text" placeholder="如 doubao-1-5-pro-32k"></div>
             <div class="field"><label>最大重试次数</label><input id="gwMaxRetries" type="number" min="1" max="10" value="3"></div>
+            <div class="field"><label>服务端口</label><input id="gwPort" type="number" min="1" max="65535" placeholder="跟随 PORT 环境变量"><p class="hint">面板和网关共用该端口，保存后立即切换监听端口并持久化，浏览器会自动跳转到新地址；留空表示跟随 PORT 环境变量（当前监听 <span id="gwPortCurrent">…</span>）</p></div>
           </div>
         </div>
         <div class="panel" style="margin-bottom:18px">
@@ -503,6 +504,8 @@ async function gwLoadConfig(){
     document.getElementById('gwApiKey').value=c.hasApiKey?'****':(c.apiKey||'');
     document.getElementById('gwDefaultModel').value=c.defaultModel||'';
     document.getElementById('gwMaxRetries').value=c.maxRetries||3;
+    document.getElementById('gwPort').value=c.port||'';
+    document.getElementById('gwPortCurrent').textContent=c.effectivePort||'-';
     const up=c.upstreams||{};
     document.getElementById('gwAgentAnthropicUrl').value=(up.agentPlan&&up.agentPlan.anthropicBaseUrl)||'';
     document.getElementById('gwAgentOpenaiUrl').value=(up.agentPlan&&up.agentPlan.openaiBaseUrl)||'';
@@ -557,10 +560,14 @@ function gwGenerateKey(){
 }
 async function gwSaveConfig(){
   const apiKeyRaw=document.getElementById('gwApiKey').value.trim();
+  const portRaw=document.getElementById('gwPort').value.trim();
+  const portParsed=portRaw?parseInt(portRaw,10):null;
+  if(portParsed!==null&&!(portParsed>=1&&portParsed<=65535)){alert('端口必须是 1-65535 之间的整数');return;}
   const payload={
     enabled:document.getElementById('gwEnabled').value==='true',
     defaultModel:document.getElementById('gwDefaultModel').value.trim(),
     maxRetries:parseInt(document.getElementById('gwMaxRetries').value)||3,
+    port:portParsed,
     upstreams:{
       agentPlan:{
         anthropicBaseUrl:document.getElementById('gwAgentAnthropicUrl').value.trim(),
@@ -576,8 +583,16 @@ async function gwSaveConfig(){
   try{
     const r=await fetch('/api/gateway/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     if(!r.ok){let m='保存失败';try{const e=await r.json();if(e.error)m=e.error}catch(_){}throw new Error(m);}
-    alert('网关配置已保存');
-    gwLoadConfig();
+    const result=await r.json();
+    const target=Number(result.effectivePort);
+    const current=Number(window.location.port)||((window.location.protocol==='https:')?443:80);
+    if(target&&target!==current){
+      alert('网关配置已保存，服务端口已切换为 '+target+'，页面即将跳转到新地址');
+      setTimeout(()=>{window.location.port=target;},800);
+    }else{
+      alert('网关配置已保存');
+      gwLoadConfig();
+    }
   }catch(e){alert('保存失败：'+e.message);}
 }
 

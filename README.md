@@ -55,6 +55,10 @@ AGENTS.md           Coding-agent instructions for this repository
 - If you import a Codex curl with `--proxy`, the proxy must be reachable from the
   Docker host.
 - Default listen port is `8080`; change `PORT` in `docker-compose.yml` if occupied.
+- You can also change the listen port at runtime in **网关管理 → 网关设置 → 服务端口**.
+  The dashboard and the gateway share this port; the change takes effect immediately
+  (the UI redirects to the new port) and persists in `data/gateway.json`. A port saved
+  there wins over the `PORT` environment variable; clear the field to follow `PORT` again.
 
 ### 1. Prepare the host directory
 

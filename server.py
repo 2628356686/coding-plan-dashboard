@@ -624,9 +624,21 @@ def gateway_active_snapshot():
     return {"activeCount": len(active), "activeRequests": active}
 
 
+def normalize_gateway_port(value):
+    """Coerce a config or payload port to a valid integer, else None (follow PORT env)."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
 def load_gateway_config():
     default = {
         "enabled": False,
+        "port": None,
         "apiKey": "",
         "defaultModel": "",
         "maxRetries": 3,
@@ -646,6 +658,7 @@ def load_gateway_config():
         if isinstance(data, dict):
             merged = dict(default)
             merged.update({k: v for k, v in data.items() if k != "upstreams"})
+            merged["port"] = normalize_gateway_port(merged.get("port"))
             upstreams = {k: dict(v) for k, v in default["upstreams"].items()}
             if isinstance(data.get("upstreams"), dict):
                 for k, v in data["upstreams"].items():
@@ -1809,6 +1822,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         config = load_gateway_config()
         reveal = "reveal=1" in self.path or "reveal=true" in self.path
         masked = dict(config)
+        masked["effectivePort"] = self.server.server_address[1]
         if masked.get("apiKey"):
             if not reveal:
                 masked["apiKey"] = mask_secret(masked["apiKey"])
@@ -1819,6 +1833,18 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
         config = load_gateway_config()
+        new_listener = None
+        if "port" in payload:
+            port = normalize_gateway_port(payload["port"])
+            if port is None and payload["port"] not in (None, ""):
+                raise ValueError("port must be an integer between 1 and 65535, or null to follow PORT")
+            target = port if port is not None else int(os.environ.get("PORT", "80"))
+            if target != self.server.server_address[1]:
+                try:
+                    new_listener = bind_dashboard_server(target)
+                except OSError as error:
+                    raise ValueError("port %d cannot be bound: %s" % (target, error)) from None
+            config["port"] = port
         for key in ("enabled", "apiKey", "defaultModel", "maxRetries"):
             if key in payload:
                 config[key] = payload[key]
@@ -1829,7 +1855,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         payload["upstreams"][cat]
                     )
         save_gateway_config(config)
-        self.send_json({"ok": True})
+        serving_port = new_listener.server_address[1] if new_listener else self.server.server_address[1]
+        self._gateway_write_json(200, {"ok": True, "port": config.get("port"), "effectivePort": serving_port})
+        if new_listener is not None:
+            activate_dashboard_server(new_listener, retire=self.server)
 
     def handle_gateway_status(self):
         config = load_gateway_config()
@@ -1881,13 +1910,41 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 
+_active_dashboard_server = {"httpd": None}
+
+
+def bind_dashboard_server(port, host="0.0.0.0"):
+    """Bind the dashboard listener without serving; raises OSError when the port is taken."""
+    return ThreadingHTTPServer((host, port), DashboardHandler)
+
+
+def activate_dashboard_server(httpd, retire=None):
+    Thread(target=httpd.serve_forever, name="dashboard-http", daemon=True).start()
+    _active_dashboard_server["httpd"] = httpd
+    if retire is not None:
+        Thread(target=_retire_dashboard_server, args=(retire,), daemon=True).start()
+
+
+def _retire_dashboard_server(httpd):
+    httpd.shutdown()
+    httpd.server_close()
+
+
 if __name__ == "__main__":
     os.chdir(os.environ.get("APP_DIR", "/srv"))
-    server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "80"))), DashboardHandler)
+    configured_port = normalize_gateway_port(load_gateway_config().get("port"))
+    httpd = bind_dashboard_server(configured_port or int(os.environ.get("PORT", "80")))
     quota_stop = Event()
     Thread(target=gateway_quota_worker, args=(DashboardHandler.requests_path, quota_stop), daemon=True).start()
+    activate_dashboard_server(httpd)
     try:
-        server.serve_forever()
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
     finally:
         quota_stop.set()
-        server.server_close()
+        current = _active_dashboard_server["httpd"]
+        if current is not None:
+            current.shutdown()
+            current.server_close()

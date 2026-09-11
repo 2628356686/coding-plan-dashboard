@@ -1,6 +1,6 @@
 @echo off
 rem Coding Plan Dashboard - run from source (Windows)
-rem Usage: double-click or run `start.bat`; open http://127.0.0.1:8080
+rem Usage: double-click or run `start.bat`; open the shown URL in a browser
 cd /d %~dp0
 set PORT=8080
 set APP_DIR=%CD%
@@ -14,14 +14,22 @@ set GATEWAY_CONFIG_PATH=%CD%\data\gateway.json
 set GATEWAY_STATS_PATH=%CD%\data\gateway_stats.json
 if not exist data mkdir data
 
-rem Kill any existing process on port 8080
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%PORT%.*LISTENING"') do (
+rem Service port: a "port" set in data/gateway.json (gateway settings page) wins over PORT
+set LISTEN_PORT=%PORT%
+if exist data\gateway.json (
+    for /f "tokens=2 delims=:, " %%p in ('findstr /C:"\"port\"" data\gateway.json 2^>nul') do (
+        if not "%%p"=="null" if not "%%p"=="" set LISTEN_PORT=%%p
+    )
+)
+
+rem Kill any existing process on the listen port
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%LISTEN_PORT%.*LISTENING"') do (
     echo Killing old process PID %%a ...
     taskkill /F /PID %%a >nul 2>&1
 )
 timeout /t 1 /nobreak >nul
 
-echo Starting Coding Plan Dashboard on http://127.0.0.1:%PORT% ...
+echo Starting Coding Plan Dashboard on http://127.0.0.1:%LISTEN_PORT% ...
 python server.py
 if errorlevel 1 (
     echo.

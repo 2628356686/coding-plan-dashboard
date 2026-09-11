@@ -1,6 +1,10 @@
 """Exercise all gateway protocols over HTTP with a local, credential-free upstream."""
 import json
 import io
+import os
+import pathlib
+import socket
+import tempfile
 import threading
 import time
 import unittest
@@ -385,6 +389,147 @@ class GatewayProtocolsTest(unittest.TestCase):
                 self.assertEqual(error.exception.code, code)
                 error.exception.close()
                 save.assert_not_called()
+
+
+class PortSettingTest(unittest.TestCase):
+    def test_normalize_gateway_port(self):
+        cases = {None: None, '': None, 0: None, -1: None, 70000: None, 'abc': None,
+                 1: 1, 65535: 65535, 8080: 8080, '8080': 8080}
+        for value, expected in cases.items():
+            self.assertEqual(server.normalize_gateway_port(value), expected, repr(value))
+        self.assertIsNone(server.normalize_gateway_port(True))
+        self.assertIsNone(server.normalize_gateway_port(False))
+
+    def test_load_gateway_config_defaults_and_sanitizes_port(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / 'gateway.json'
+            with patch.object(server, 'GATEWAY_CONFIG_PATH', path):
+                self.assertIsNone(server.load_gateway_config()['port'])
+                path.write_text(json.dumps({'port': 9090, 'apiKey': 'k'}), encoding='utf-8')
+                config = server.load_gateway_config()
+                self.assertEqual(config['port'], 9090)
+                self.assertEqual(config['apiKey'], 'k')
+                self.assertEqual(config['maxRetries'], 3)
+                path.write_text(json.dumps({'port': 'not-a-port'}), encoding='utf-8')
+                self.assertIsNone(server.load_gateway_config()['port'])
+
+
+class GatewayPortConfigTest(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+
+        class Quiet(server.DashboardHandler):
+            def log_message(self, *args):
+                pass
+
+        httpd = ThreadingHTTPServer(('127.0.0.1', 0), Quiet)
+        self.old_port = httpd.server_address[1]
+        self.base = 'http://127.0.0.1:%d' % self.old_port
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.stack.callback(httpd.shutdown)
+        self.stack.callback(httpd.server_close)
+        self.stack.callback(thread.join, 2)
+        self.stack.enter_context(patch.dict(server._active_dashboard_server, {'httpd': httpd}, clear=True))
+        self.stack.callback(self._stop_switched_server)
+        self.stack.enter_context(patch.object(server, 'DashboardHandler', Quiet))
+        tmp = tempfile.TemporaryDirectory()
+        self.stack.callback(tmp.cleanup)
+        self.config_path = pathlib.Path(tmp.name) / 'gateway.json'
+        self.base_config = {'enabled': True, 'apiKey': 'k'}
+        self.config_path.write_text(json.dumps(self.base_config), encoding='utf-8')
+        self.stack.enter_context(patch.object(server, 'GATEWAY_CONFIG_PATH', self.config_path))
+
+    def _stop_switched_server(self):
+        httpd = server._active_dashboard_server['httpd']
+        if httpd is not None:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def free_port(self):
+        probe = socket.socket()
+        probe.bind(('0.0.0.0', 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        return port
+
+    def occupy_port(self):
+        port = self.free_port()
+        sock = socket.socket()
+        if os.name == 'nt':
+            # Windows honours SO_REUSEADDR double binds unless the occupant is exclusive.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        sock.bind(('0.0.0.0', port))
+        sock.listen(1)
+        self.stack.callback(sock.close)
+        return port
+
+    def post_config(self, payload):
+        req = Request(self.base + '/api/gateway/config', data=json.dumps(payload).encode(),
+                      headers={'Content-Type': 'application/json'})
+        return urlopen(req, timeout=5)
+
+    def wait_serving(self, base, timeout=3):
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return urlopen(base + '/api/gateway/config', timeout=2)
+            except OSError:
+                # Windows may reset backlog connections instead of refusing them.
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+
+    def test_port_change_rebinds_serves_and_persists(self):
+        new_port = self.free_port()
+        with self.post_config({'port': new_port}) as response:
+            result = json.load(response)
+        self.assertEqual(result['port'], new_port)
+        self.assertEqual(result['effectivePort'], new_port)
+        self.assertEqual(json.loads(self.config_path.read_text(encoding='utf-8'))['port'], new_port)
+        new_base = 'http://127.0.0.1:%d' % new_port
+        with self.wait_serving(new_base) as response:
+            self.assertEqual(json.load(response)['effectivePort'], new_port)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                urlopen(self.base + '/api/gateway/config', timeout=1).close()
+            except OSError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail('old port %d is still serving' % self.old_port)
+
+    def test_port_change_to_occupied_port_is_rejected(self):
+        occupied = self.occupy_port()
+        with self.assertRaises(HTTPError) as error:
+            self.post_config({'port': occupied})
+        self.assertEqual(error.exception.code, 400)
+        error.exception.close()
+        self.assertEqual(json.loads(self.config_path.read_text(encoding='utf-8')), self.base_config)
+        with self.wait_serving(self.base) as response:
+            self.assertEqual(json.load(response)['effectivePort'], self.old_port)
+
+    def test_invalid_port_is_rejected_without_persisting(self):
+        for value in (70000, 'abc', True, -1):
+            with self.assertRaises(HTTPError) as error:
+                self.post_config({'port': value})
+            self.assertEqual(error.exception.code, 400)
+            error.exception.close()
+        self.assertEqual(json.loads(self.config_path.read_text(encoding='utf-8')), self.base_config)
+
+    def test_null_port_rebinds_to_env_port(self):
+        env_port = self.free_port()
+        with patch.dict(os.environ, {'PORT': str(env_port)}):
+            with self.post_config({'port': None}) as response:
+                result = json.load(response)
+        self.assertIsNone(result['port'])
+        self.assertEqual(result['effectivePort'], env_port)
+        self.assertIsNone(json.loads(self.config_path.read_text(encoding='utf-8'))['port'])
+        env_base = 'http://127.0.0.1:%d' % env_port
+        with self.wait_serving(env_base) as response:
+            self.assertEqual(json.load(response)['effectivePort'], env_port)
 
 
 class ResponsesStreamTest(unittest.TestCase):
