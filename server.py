@@ -1606,8 +1606,8 @@ def is_quota_exhausted(status, body_text):
 # ============================================================================
 
 SMS_CONFIG_PATH = Path(os.environ.get("SMS_CONFIG_PATH", "/data/sms.json"))
-EOMSG_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "Chrome/140 Safari/537.36")
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "Chrome/140 Safari/537.36")
 
 
 class SmsError(Exception):
@@ -1678,7 +1678,12 @@ def smsnex_upstream(cfg, method, path, query=None, body=None):
     url = cfg["origin"].rstrip("/") + "/openapi/v1" + path
     if query:
         url += "?" + urlencode(query)
-    request = Request(url, method=method, headers={"Authorization": "Bearer " + cfg["apiKey"]})
+    # Cloudflare fronts smsnex and bans the Python-urllib signature (403/1010).
+    request = Request(url, method=method, headers={
+        "Authorization": "Bearer " + cfg["apiKey"],
+        "User-Agent": BROWSER_UA,
+        "Accept": "application/json, text/plain, */*",
+    })
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -1717,7 +1722,7 @@ def eomsg_upstream(cfg, code, params=()):
     for attempt in range(3):
         try:
             request = Request(url, headers={
-                "User-Agent": EOMSG_UA,
+                "User-Agent": BROWSER_UA,
                 "Accept": "text/plain, */*",
                 "Referer": "https://www.eomsg.com/",
             })
