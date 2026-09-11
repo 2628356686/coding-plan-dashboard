@@ -12,6 +12,8 @@ set CREDENTIALS_PATH=%CD%\data\credentials.json
 set ORDER_PATH=%CD%\data\order.json
 set GATEWAY_CONFIG_PATH=%CD%\data\gateway.json
 set GATEWAY_STATS_PATH=%CD%\data\gateway_stats.json
+if not exist log mkdir log
+set LOG_PATH=%CD%\log\dashboard.log
 if not exist data mkdir data
 
 rem Service port: a "port" set in data/gateway.json (gateway settings page) wins over PORT

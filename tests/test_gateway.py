@@ -20,6 +20,20 @@ REAL_SELECT = server.select_gateway_account
 
 
 class ImageConversionTest(unittest.TestCase):
+    def test_original_image_detail_normalization_preserves_input_and_other_values(self):
+        parts = [{'type': 'image_url', 'image_url': {'url': 'https://example.com/a.png', 'detail': value}}
+                 for value in ('original', 'low', 'high', 'xhigh', 'auto')]
+        parts += [{'type': 'text', 'text': 'original'},
+                  {'type': 'image_url', 'image_url': 'https://example.com/b.png'}]
+        body = {'messages': [{'role': 'user', 'content': parts}]}
+        original = json.dumps(body)
+        result = server.normalize_volcengine_image_detail(body)
+        content = result['messages'][0]['content']
+        self.assertEqual([p['image_url']['detail'] for p in content[:5]],
+                         ['high', 'low', 'high', 'xhigh', 'auto'])
+        self.assertEqual(content[5:], parts[5:])
+        self.assertEqual(json.dumps(body), original)
+
     def test_anthropic_images_convert_to_openai_parts(self):
         body = {'model': 'm', 'max_tokens': 10, 'messages': [{'role': 'user', 'content': [
             {'type': 'text', 'text': '这是什么'},
@@ -272,6 +286,117 @@ class GatewayProtocolsTest(unittest.TestCase):
         self.assertEqual(content[0], {'type': 'text', 'text': '这是什么'})
         self.assertIn({'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,QUJD'}}, content)
 
+    def test_responses_tool_call_screenshot_and_next_turn_over_http(self):
+        from test_responses_tools import TOOLS, frame, chat_delta
+        for upstream in ('openai', 'anthropic'):
+            self.config['upstreams'] = {'test': {upstream + 'BaseUrl': self.upstream}}
+            for stream in (False, True):
+                with self.subTest(upstream=upstream, stream=stream):
+                    if upstream == 'openai':
+                        call = {'index': 0, 'id': 'capture_a', 'type': 'function', 'function': {
+                            'name': 'screenshot', 'arguments': '{"app":"test"}'}}
+                        reply = {'choices': [{'message': {'content': None, 'tool_calls': [call]}, 'finish_reason': 'tool_calls'}]}
+                        data = chat_delta([call]) + chat_delta(finish='tool_calls') + b'data: [DONE]\n\n'
+                    else:
+                        block = {'type': 'tool_use', 'id': 'capture_a', 'name': 'screenshot', 'input': {'app': 'test'}}
+                        reply = {'content': [block], 'stop_reason': 'tool_use'}
+                        data = frame({'type': 'content_block_start', 'index': 0, 'content_block': block})
+                        data += frame({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use'}})
+                        data += frame({'type': 'message_stop'})
+                    self.failure = (200, data if stream else json.dumps(reply).encode(),
+                                    'text/event-stream' if stream else 'application/json')
+
+                    def send(body):
+                        req = Request(self.gateway + '/v1/responses', data=json.dumps(body).encode(),
+                                      headers={'x-api-key': 'test-only', 'Content-Type': 'application/json'})
+                        with urlopen(req, timeout=5) as response:
+                            self.assertEqual(response.status, 200)
+                            data = response.read()
+                        if stream:
+                            events = [json.loads(line[6:]) for line in data.splitlines() if line.startswith(b'data: ')]
+                            self.assertEqual(events[-1]['type'], 'response.completed')
+                            return events[-1]['response']
+                        return json.loads(data)
+
+                    request = {'model': 'test-model', 'stream': stream, 'tools': TOOLS,
+                               'input': [{'role': 'user', 'content': 'Inspect app'}]}
+                    output = send(request)['output']
+                    self.assertEqual(output[0]['type'], 'function_call')
+                    self.assertEqual(output[0]['call_id'], 'capture_a')
+                    self.assertTrue(self.requests[-1][1]['tools'])
+                    request['input'] += output + [{'type': 'function_call_output', 'call_id': 'capture_a',
+                        'output': [{'type': 'input_text', 'text': 'App captured'},
+                                   {'type': 'input_image', 'image_url': 'data:image/png;base64,QUJD'}]}]
+                    self.failure = None
+                    self.assertEqual(send(request)['output'][0]['content'][0]['text'], '你好')
+                    forwarded = self.requests[-1][1]['messages']
+                    if upstream == 'openai':
+                        self.assertEqual([m['role'] for m in forwarded], ['user', 'assistant', 'tool', 'user'])
+                        self.assertEqual(forwarded[-1]['content'][0]['image_url']['url'], 'data:image/png;base64,QUJD')
+                    else:
+                        self.assertEqual(forwarded[-1]['content'][0]['type'], 'tool_result')
+                        self.assertEqual(forwarded[-1]['content'][-1]['source']['data'], 'QUJD')
+
+    def test_responses_invalid_tool_definition_returns_400_before_upstream(self):
+        self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream}}
+        request = Request(self.gateway + '/v1/responses', data=json.dumps({
+            'input': 'hello', 'tools': [{'type': 'web_search'}]}).encode(),
+            headers={'x-api-key': 'test-only', 'Content-Type': 'application/json'})
+        with self.assertRaises(HTTPError) as error:
+            urlopen(request, timeout=5)
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn('does not support tool type', json.load(error.exception)['error']['message'])
+        error.exception.close()
+        self.assertEqual(self.requests, [])
+
+    def test_responses_custom_namespace_tool_restored_over_http(self):
+        from test_responses_tools import chat_delta
+        self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream}}
+        tools = [{'type': 'namespace', 'name': 'functions', 'tools': [
+            {'type': 'custom', 'name': 'exec', 'description': 'Execute code'}]}]
+        raw = 'print("hello")\n'
+        call = {'index': 0, 'id': 'code_a', 'function': {
+            'name': server.responses_tool_alias('exec', 'functions'), 'arguments': json.dumps({'input': raw})}}
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                reply = {'choices': [{'message': {'tool_calls': [call]}, 'finish_reason': 'tool_calls'}]}
+                data = chat_delta([call]) + b'data: [DONE]\n\n' if stream else json.dumps(reply).encode()
+                self.failure = (200, data, 'text/event-stream' if stream else 'application/json')
+                req = Request(self.gateway + '/v1/responses', data=json.dumps({
+                    'model': 'test-model', 'stream': stream, 'tools': tools, 'input': 'Run code'}).encode(),
+                    headers={'x-api-key': 'test-only', 'Content-Type': 'application/json'})
+                with urlopen(req, timeout=5) as response:
+                    payload = response.read()
+                if stream:
+                    result = [json.loads(line[6:]) for line in payload.splitlines() if line.startswith(b'data: ')][-1]['response']
+                else:
+                    result = json.loads(payload)
+                item = result['output'][0]
+                self.assertEqual((item['type'], item['namespace'], item['name'], item['input']),
+                                 ('custom_tool_call', 'functions', 'exec', raw))
+
+    def test_original_image_detail_is_adapted_only_for_codex_on_volcengine_upstreams(self):
+        for originator in ('Codex Desktop', 'ZCode'):
+            for category in ('agentPlan', 'codingPlan', 'other'):
+                self.config['upstreams'] = {category: {'openaiBaseUrl': self.upstream}}
+                with self.subTest(originator=originator, category=category):
+                    body = {'model': 'test-model', 'stream': False, 'messages': [
+                        {'role': 'user', 'content': [
+                            {'type': 'image_url', 'image_url': {
+                                'url': 'data:image/png;base64,QUJD', 'detail': 'original'}}]}]}
+                    req = Request(self.gateway + '/v1/chat/completions',
+                                  data=json.dumps(body).encode(), headers={
+                                      'Authorization': 'Bearer test-only', 'Content-Type': 'application/json',
+                                      'Originator': originator})
+                    with patch.object(server, 'gateway_category_for_account', return_value=category):
+                        with urlopen(req, timeout=5) as response:
+                            self.assertEqual(response.status, 200)
+                            response.read()
+                    image_url = self.requests[-1][1]['messages'][0]['content'][0]['image_url']
+                    adapted = originator == 'Codex Desktop' and category != 'other'
+                    self.assertEqual(image_url['detail'], 'high' if adapted else 'original')
+                    self.assertEqual(image_url['url'], 'data:image/png;base64,QUJD')
+
     def test_upstream_errors_are_not_successful_empty_messages(self):
         self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream}}
         for protocol in ('openai', 'anthropic', 'responses'):
@@ -410,6 +535,49 @@ class GatewayProtocolsTest(unittest.TestCase):
                 result = json.load(response)
             self.assertEqual(result['gateway'], {'enabled': False})
             self.assertEqual(save.call_count, 1)
+
+    def test_dashboard_hide_keeps_record_clears_key_and_skips_refresh(self):
+        curl = 'curl https://console.volcengine.com/'
+        accounts = {'a': {'source': 'volcAgent', 'label': 'A', 'curl': curl,
+                          'apiKey': 'k-a', 'phone': '123'},
+                    'b': {'source': 'volcAgent', 'label': 'B', 'curl': curl,
+                          'apiKey': 'k-b'}}
+        tmp = tempfile.TemporaryDirectory()
+        self.stack.callback(tmp.cleanup)
+        results_path = pathlib.Path(tmp.name) / 'results.json'
+        with patch.object(server, 'load_requests', return_value=accounts), \
+             patch.object(server, 'save_requests') as save, \
+             patch.object(server, 'execute_curl', return_value=(200, '{}', '')), \
+             patch.object(server, 'infer_source', return_value='volcAgent'), \
+             patch.object(server.DashboardHandler, 'results_path', results_path):
+            def post(path, payload):
+                req = Request(self.gateway + path, data=json.dumps(payload).encode(),
+                              headers={'Content-Type': 'application/json'})
+                return urlopen(req, timeout=3)
+            with post('/api/requests', {'id': 'a', 'label': 'A', 'curl': curl,
+                                        'apiKey': '', 'dashboardHidden': True}) as response:
+                self.assertEqual(json.load(response)['id'], 'a')
+            self.assertNotIn('apiKey', accounts['a'])
+            self.assertTrue(accounts['a'].get('dashboardHidden'))
+            self.assertEqual(accounts['a'].get('phone'), '123')
+            with post('/api/requests', {'id': 'b', 'label': 'B2', 'curl': curl}):
+                pass
+            self.assertEqual(accounts['b'].get('apiKey'), 'k-b')
+            self.assertNotIn('dashboardHidden', accounts['b'])
+            with post('/api/requests', {'id': 'a', 'label': 'A', 'curl': curl,
+                                        'dashboardHidden': False}):
+                pass
+            self.assertNotIn('dashboardHidden', accounts['a'])
+            with post('/api/requests', {'id': 'a', 'label': 'A', 'curl': curl,
+                                        'apiKey': '', 'dashboardHidden': True}):
+                pass
+            req = Request(self.gateway + '/api/refresh', data=b'{}',
+                          headers={'Content-Type': 'application/json'})
+            with urlopen(req, timeout=3) as response:
+                results = json.load(response)
+            self.assertIn('b', results)
+            self.assertNotIn('a', results)
+            save.assert_called()
 
 
 class PortSettingTest(unittest.TestCase):
@@ -589,6 +757,36 @@ class ActiveRequestLifecycleTest(unittest.TestCase):
                 self.assertEqual(server.gateway_active_snapshot()['activeCount'], 1)
                 raise RuntimeError('connection ended')
         self.assertEqual(server.gateway_active_snapshot()['activeCount'], 0)
+
+
+class AgentPlatformTest(unittest.TestCase):
+    def test_originator_header_wins(self):
+        headers = {'Originator': 'Codex Desktop', 'User-Agent': 'ZCode/3.10.0'}
+        self.assertEqual(server.detect_gateway_agent_platform(headers), 'Codex Desktop')
+
+    def test_user_agent_fallback(self):
+        ua = 'Codex Desktop/0.153.4 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.903.71938)'
+        self.assertEqual(server.detect_gateway_agent_platform({'User-Agent': ua}), 'Codex Desktop')
+        self.assertEqual(server.detect_gateway_agent_platform({'User-Agent': 'ZCode/3.10.0'}), 'ZCode')
+
+    def test_missing_headers_report_unknown(self):
+        self.assertEqual(server.detect_gateway_agent_platform({}), 'unknown')
+
+    def test_active_snapshot_includes_platform(self):
+        with patch.dict(server._gateway_active, {}, clear=True):
+            with server.track_gateway_request('acc', {'label': 'Example'}, 'model', 'openai', True, 'Codex Desktop'):
+                active = server.gateway_active_snapshot()['activeRequests'][0]
+        self.assertEqual(active['platform'], 'Codex Desktop')
+
+    def test_record_gateway_request_persists_platform_stats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stats_path = pathlib.Path(tmp) / 'gateway_stats.json'
+            with patch.object(server, 'GATEWAY_STATS_PATH', stats_path), \
+                 patch.dict(server._gateway_stats, {'total_requests': 0, 'by_account': {}}, clear=True):
+                server.record_gateway_request('acc', 'Codex Desktop')
+                saved = json.loads(stats_path.read_text(encoding='utf-8'))
+        self.assertEqual(saved['total_requests'], 1)
+        self.assertEqual(saved['by_platform'], {'Codex Desktop': 1})
 
 
 class RoutingTest(unittest.TestCase):

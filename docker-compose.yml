@@ -6,6 +6,7 @@ services:
     environment:
       PORT: "8080"
       APP_REVISION: "2026-07-14-codex-agentplan-fix"
+      LOG_PATH: "/data/dashboard.log"
     command: ["python", "/srv/server.py"]
     volumes:
       - /docker/coding_plan_quota_dashboard/index.html:/srv/index.html:ro

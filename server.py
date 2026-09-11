@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shlex
@@ -13,6 +14,7 @@ import random
 import uuid
 import math
 from contextlib import contextmanager, ExitStack
+from logging.handlers import RotatingFileHandler
 from threading import RLock, Thread, Event
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +23,45 @@ from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
+
+
+_DEFAULT_LOG_PATH = Path(__file__).resolve().parent / "log" / "dashboard.log"
+LOG_PATH = Path(os.environ.get("LOG_PATH") or _DEFAULT_LOG_PATH)
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
+
+
+def build_file_logger(path, name="dashboard"):
+    """Persistent rotating log; falls back to stderr when the path is unwritable."""
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if logger.handlers:
+        return logger
+    formatter = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(path, maxBytes=LOG_MAX_BYTES,
+                                      backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
+    except OSError:
+        handler = logging.StreamHandler(sys.stderr)
+        logger.warning("log file %s unavailable, logging to stderr instead", path)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+
+log = build_file_logger(LOG_PATH)
+
+
+def tail_log_file(path, limit):
+    """Return the last `limit` lines of a text log file, or "" when unavailable."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return ""
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    return "\n".join(lines[-limit:])
 
 
 def now_iso():
@@ -555,12 +596,14 @@ def refresh_gateway_quotas(accounts):
         try:
             status, body, _ = execute_curl(account["curl"])
             if not is_success_status(status):
+                log.warning("gw quota refresh for %s failed: HTTP %s", aid, status)
                 continue
             quota = normalize_gateway_quota(json.loads(body))
             with _gateway_active_lock:
                 _gateway_quota_cache[aid] = quota
-        except (ValueError, TypeError, AttributeError, OSError):
+        except (ValueError, TypeError, AttributeError, OSError) as error:
             # Keep the last known quota when credentials or the endpoint fail.
+            log.warning("gw quota refresh for %s failed: %s", aid, error)
             continue
 
 
@@ -589,23 +632,24 @@ def gateway_quota_worker(requests_path, stop):
 
 
 @contextmanager
-def reserve_gateway_account(accounts, snapshot, model, protocol, stream):
+def reserve_gateway_account(accounts, snapshot, model, protocol, stream, platform="unknown"):
     # Selection and reservation share a lock so simultaneous requests see each other.
     with ExitStack() as stack:
         with _gateway_active_lock:
             aid, account = select_gateway_account(accounts, gateway_routing_snapshot(snapshot))
             if aid:
-                stack.enter_context(track_gateway_request(aid, account, model, protocol, stream))
+                stack.enter_context(track_gateway_request(aid, account, model, protocol, stream, platform))
         yield aid, account
 
 
 @contextmanager
-def track_gateway_request(account_id, account, model, protocol, stream):
+def track_gateway_request(account_id, account, model, protocol, stream, platform="unknown"):
     request_id = uuid.uuid4().hex
     entry = {
         "id": request_id, "accountId": account_id,
         "accountLabel": account.get("label") or account.get("accountId") or account_id,
         "model": model, "protocol": protocol, "stream": bool(stream),
+        "platform": platform,
         "startedAt": now_iso(), "startedMonotonic": time.monotonic(),
     }
     with _gateway_active_lock:
@@ -692,6 +736,9 @@ def save_gateway_stats(stats):
     save_snapshot(str(GATEWAY_STATS_PATH), stats)
 
 
+_gateway_stats.update(load_gateway_stats())
+
+
 def account_remaining_percent(account_id, snapshot):
     """Return remaining-quota percentage (0-100); 50 when no data."""
     data = snapshot.get(account_id)
@@ -761,16 +808,34 @@ def select_gateway_account(accounts, snapshot):
     return chosen, accounts[chosen]
 
 
-def cooldown_account(account_id, seconds=GATEWAY_COOLDOWN_SECONDS):
+def cooldown_account(account_id, seconds=GATEWAY_COOLDOWN_SECONDS, reason=""):
     with _gateway_active_lock:
         _gateway_cooldowns[account_id] = time.time() + seconds
+    log.warning("gw account %s cooldown %ss: %s", account_id, seconds, reason or "unspecified")
 
 
-def record_gateway_request(account_id):
+def record_gateway_request(account_id, platform="unknown"):
     with _gateway_active_lock:
         _gateway_stats["total_requests"] = _gateway_stats.get("total_requests", 0) + 1
         by_acc = _gateway_stats.setdefault("by_account", {})
         by_acc[account_id] = by_acc.get(account_id, 0) + 1
+        by_platform = _gateway_stats.setdefault("by_platform", {})
+        by_platform[platform] = by_platform.get(platform, 0) + 1
+    try:
+        save_gateway_stats(_gateway_stats)
+    except OSError:
+        pass
+
+
+def detect_gateway_agent_platform(headers):
+    """Best-effort client platform from inbound gateway headers."""
+    originator = str(headers.get("Originator") or "").strip()
+    if originator:
+        return originator
+    user_agent = str(headers.get("User-Agent") or "").strip()
+    if user_agent:
+        return user_agent.split("/", 1)[0].strip() or "unknown"
+    return "unknown"
 
 
 # ---- Protocol conversion (inbound -> OpenAI upstream) ----
@@ -844,6 +909,28 @@ def openai_to_anthropic(body, model):
     }
 
 
+def normalize_volcengine_image_detail(body):
+    """Copy Chat image parts and adapt Codex's original detail for Volcengine."""
+    result = dict(body)
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return result
+    result["messages"] = []
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            result["messages"].append(message)
+            continue
+        parts = []
+        for part in message["content"]:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict) and image_url.get("detail") == "original":
+                    part = {**part, "image_url": {**image_url, "detail": "high"}}
+            parts.append(part)
+        result["messages"].append({**message, "content": parts})
+    return result
+
+
 def responses_image_url(part):
     """Responses input_image part -> image URL string, or None."""
     url = part.get("image_url")
@@ -852,55 +939,187 @@ def responses_image_url(part):
     return str(url) if url else None
 
 
-def responses_to_openai(body):
+def responses_tool_alias(name, namespace=None):
+    """Stable, Chat-compatible names; keep a per-request reverse map."""
+    if not namespace and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+        return name
+    identity = json.dumps([namespace, name], ensure_ascii=False)
+    return "tool_" + hashlib.sha256(identity.encode()).hexdigest()[:40]
+
+
+def responses_tools_to_openai(tools, context):
+    result = []
+
+    def add(tool, namespace=None):
+        kind = tool.get("type")
+        if kind == "namespace":
+            for child in tool.get("tools", []):
+                add(child, tool["name"])
+            return
+        if kind == "tool_search" and tool.get("execution") != "client":
+            raise ValueError("Responses bridge supports only client-executed tool_search")
+        if kind not in ("function", "custom", "tool_search"):
+            raise ValueError("Responses bridge does not support tool type: " + str(kind))
+        name = "__gateway_tool_search" if kind == "tool_search" else tool.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("tool name is required")
+        alias = responses_tool_alias(name, namespace)
+        if alias in context:
+            raise ValueError("duplicate tool name")
+        context[alias] = {"name": name, "type": kind, "namespace": namespace}
+        function = {"name": alias, "description": tool.get("description", "")}
+        if kind == "custom":
+            function["parameters"] = {"type": "object", "properties": {
+                "input": {"type": "string", "description": "The complete raw input for this tool."}},
+                "required": ["input"], "additionalProperties": False}
+            if tool.get("format"):
+                function["description"] += "\nInput format: " + json.dumps(tool["format"], ensure_ascii=False)
+        else:
+            function["parameters"] = tool.get("parameters") or {"type": "object", "properties": {}}
+            if "strict" in tool:
+                function["strict"] = tool["strict"]
+        result.append({"type": "function", "function": function})
+
+    for tool in tools:
+        add(tool)
+    return result
+
+
+def responses_content_to_openai(content):
+    """Keep ordered text/image parts, including MCP image results."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict) and "content" in content:
+        content = content["content"]
+    if not isinstance(content, list):
+        return json.dumps(content, ensure_ascii=False)
+    parts = []
+    for part in content:
+        if not isinstance(part, dict):
+            parts.append({"type": "text", "text": str(part)})
+            continue
+        kind = part.get("type")
+        if kind in ("text", "input_text", "output_text"):
+            parts.append({"type": "text", "text": part.get("text", "")})
+        elif kind in ("input_image", "image_url", "image"):
+            url = responses_image_url(part)
+            if not url and part.get("data"):
+                url = "data:%s;base64,%s" % (part.get("mimeType", "image/png"), part["data"])
+            if not url and part.get("source"):
+                url = anthropic_image_to_openai_url(part["source"])
+            if not url:
+                raise ValueError("image requires inline data or an image URL; file_id is not supported")
+            image = {"url": url}
+            detail = part.get("detail")
+            if isinstance(part.get("image_url"), dict):
+                detail = part["image_url"].get("detail", detail)
+            if detail is not None:
+                image["detail"] = detail
+            parts.append({"type": "image_url", "image_url": image})
+        else:
+            raise ValueError("unsupported Responses content type: " + str(kind))
+    if all(p["type"] == "text" for p in parts):
+        return "".join(p["text"] for p in parts)
+    return parts
+
+
+def responses_to_openai(body, tool_context=None):
+    if body.get("previous_response_id"):
+        raise ValueError("Responses bridge is stateless; send full input history instead of previous_response_id")
+    context = tool_context if tool_context is not None else {}
+    tools = responses_tools_to_openai(body.get("tools") or [], context)
+    # Tool search can declare additional tools in input history rather than tools.
+    for entry in body.get("input", []) if isinstance(body.get("input"), list) else []:
+        if isinstance(entry, dict) and entry.get("type") == "tool_search_output":
+            loaded_context = {}
+            for tool in responses_tools_to_openai(entry.get("tools") or [], loaded_context):
+                alias = tool["function"]["name"]
+                if alias not in context:
+                    tools.append(tool)
+                    context[alias] = loaded_context[alias]
     messages = []
     if body.get("instructions"):
         messages.append({"role": "system", "content": str(body["instructions"])})
 
-    def content_to_openai(content):
-        """Message content list -> OpenAI content (string, or list with images)."""
-        if not isinstance(content, list):
-            return content
-        text_parts = []
-        image_parts = []
-        for c in content:
-            if not isinstance(c, dict):
-                continue
-            if c.get("type") in ("input_text", "output_text"):
-                text_parts.append(c.get("text", ""))
-            elif c.get("type") == "input_image":
-                url = responses_image_url(c)
-                if url:
-                    image_parts.append({"type": "image_url", "image_url": {"url": url}})
-        if image_parts:
-            return ([{"type": "text", "text": text} for text in text_parts if text] + image_parts)
-        return "".join(text_parts)
-
     user_input = body.get("input", "")
     if isinstance(user_input, list):
-        text_parts = []
-        image_parts = []
+        pending = set()
+        images = []
         for item in user_input:
             if isinstance(item, dict):
                 if item.get("type") == "message" or "role" in item:
                     messages.append({
                         "role": item.get("role", "user"),
-                        "content": content_to_openai(item.get("content", [])),
+                        "content": responses_content_to_openai(item.get("content", [])),
                     })
-                elif item.get("type") == "input_text":
-                    text_parts.append(item.get("text", ""))
-                elif item.get("type") == "input_image":
-                    url = responses_image_url(item)
-                    if url:
-                        image_parts.append({"type": "image_url", "image_url": {"url": url}})
-        if image_parts:
-            user_input = [{"type": "text", "text": text} for text in text_parts if text] + image_parts
-        else:
-            user_input = "".join(text_parts)
+                elif item.get("type") in ("function_call", "custom_tool_call", "tool_search_call"):
+                    call_id = item["call_id"]
+                    search = item["type"] == "tool_search_call"
+                    if search and item.get("execution") != "client":
+                        raise ValueError("server-executed tool search history is not supported")
+                    alias = "__gateway_tool_search" if search else responses_tool_alias(item["name"], item.get("namespace"))
+                    arguments = (json.dumps({"input": item.get("input", "")}, ensure_ascii=False)
+                                 if item["type"] == "custom_tool_call" else item.get("arguments", "{}"))
+                    if search:
+                        arguments = json.dumps(item.get("arguments", {}), ensure_ascii=False)
+                    if not isinstance(json.loads(arguments), dict):
+                        raise ValueError("tool arguments must be a JSON object")
+                    call = {"id": call_id, "type": "function", "function": {"name": alias, "arguments": arguments}}
+                    if messages and messages[-1]["role"] == "assistant":
+                        messages[-1].setdefault("tool_calls", []).append(call)
+                    else:
+                        messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
+                    pending.add(call_id)
+                elif item.get("type") in ("function_call_output", "custom_tool_call_output", "tool_search_output"):
+                    if item.get("call_id") not in pending:
+                        raise ValueError("tool result has no matching pending tool call")
+                    output = (json.dumps({"tools": item.get("tools", [])}, ensure_ascii=False)
+                              if item["type"] == "tool_search_output" else item.get("output", ""))
+                    # Some MCP clients serialize their content wrapper as JSON.
+                    if isinstance(output, str):
+                        try:
+                            decoded = json.loads(output)
+                            if isinstance(decoded, dict) and isinstance(decoded.get("content"), list):
+                                output = decoded
+                        except (ValueError, TypeError):
+                            pass
+                    content = responses_content_to_openai(output)
+                    if isinstance(content, list):
+                        images.extend(p for p in content if p["type"] == "image_url")
+                        content = "".join(p["text"] for p in content if p["type"] == "text")
+                    messages.append({"role": "tool", "tool_call_id": item["call_id"], "content": content})
+                    pending.discard(item["call_id"])
+                    # Chat tool messages cannot carry images. Insert them after all
+                    # parallel results, so assistant/tool adjacency remains valid.
+                    if not pending and images:
+                        messages.append({"role": "user", "content": images})
+                        images = []
+                elif item.get("type") in ("input_text", "input_image"):
+                    messages.append({"role": "user", "content": responses_content_to_openai([item])})
+                elif item.get("type") == "reasoning":
+                    continue  # Opaque provider reasoning cannot be replayed to Chat.
+                else:
+                    raise ValueError("unsupported Responses input type: " + str(item.get("type")))
+        if pending:
+            raise ValueError("tool call history is missing tool results")
+        user_input = ""
     if user_input:
         messages.append({"role": "user", "content": user_input})
     result = {"messages": messages}
-    for key in ("model", "temperature", "top_p", "stream"):
+    if tools:
+        result["tools"] = tools
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict):
+        if choice.get("type") not in ("function", "custom", "tool_search"):
+            raise ValueError("unsupported Responses tool_choice")
+        alias = ("__gateway_tool_search" if choice["type"] == "tool_search"
+                 else responses_tool_alias(choice["name"], choice.get("namespace")))
+        if alias not in context:
+            raise ValueError("tool_choice must name a declared tool")
+        result["tool_choice"] = {"type": "function", "function": {"name": alias}}
+    elif choice is not None:
+        result["tool_choice"] = choice
+    for key in ("model", "temperature", "top_p", "stream", "parallel_tool_calls"):
         if body.get(key) is not None:
             result[key] = body[key]
     if body.get("max_output_tokens"):
@@ -908,23 +1127,57 @@ def responses_to_openai(body):
     return result
 
 
-def openai_to_responses(body, model):
+def response_tool_item(call, context=None):
+    function = call.get("function") or {}
+    name = function.get("name", "")
+    if not name or not call.get("id"):
+        raise ValueError("upstream tool call is missing its name or id")
+    spec = (context or {}).get(name, {"name": name, "type": "function"})
+    if context is not None and name not in context:
+        raise ValueError("upstream called an undeclared tool")
+    item = {"id": "fc_" + uuid.uuid4().hex, "call_id": call["id"],
+            "name": spec["name"], "status": "completed"}
+    if spec.get("namespace"):
+        item["namespace"] = spec["namespace"]
+    arguments = function.get("arguments") or "{}"
+    if spec["type"] == "tool_search":
+        arguments = json.loads(arguments)
+        if not isinstance(arguments, dict):
+            raise ValueError("tool search arguments must be an object")
+        item.pop("name")
+        item.update(type="tool_search_call", execution="client", arguments=arguments)
+    elif spec["type"] == "custom":
+        payload = json.loads(arguments)
+        if not isinstance(payload, dict) or not isinstance(payload.get("input"), str):
+            raise ValueError("custom tool arguments require a string input")
+        item.update(type="custom_tool_call", input=payload["input"])
+    else:
+        if not isinstance(json.loads(arguments), dict):
+            raise ValueError("tool arguments must be a JSON object")
+        item.update(type="function_call", arguments=arguments)
+    return item
+
+
+def openai_to_responses(body, model, tool_context=None):
     choice = (body.get("choices") or [{}])[0]
     message = choice.get("message", {})
     content = message.get("content", "") or ""
+    output = []
+    if content:
+        output.append({"id": "msg_" + uuid.uuid4().hex, "type": "message", "status": "completed",
+                       "role": "assistant", "content": [{"type": "output_text", "text": content, "annotations": []}]})
+    incomplete = choice.get("finish_reason") in ("length", "content_filter")
+    if not incomplete:
+        output.extend(response_tool_item(call, tool_context) for call in message.get("tool_calls") or [])
     return {
         "id": body.get("id", "resp_" + uuid.uuid4().hex[:16]),
         "object": "response",
         "model": model,
         "created_at": int(time.time()),
-        "status": "completed",
-        "output": [{
-            "id": "msg_" + uuid.uuid4().hex,
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": content, "annotations": []}],
-        }],
+        "status": "incomplete" if incomplete else "completed",
+        "error": None,
+        "incomplete_details": {"reason": "max_output_tokens" if choice.get("finish_reason") == "length" else "content_filter"} if incomplete else None,
+        "output": output,
         "usage": {
             "input_tokens": body.get("usage", {}).get("prompt_tokens", 0),
             "output_tokens": body.get("usage", {}).get("completion_tokens", 0),
@@ -945,10 +1198,12 @@ def iter_sse_data(stream):
         elif line.startswith("data:"):
             value = line[5:]
             data.append(value[1:] if value.startswith(" ") else value)
+    if data:
+        yield "\n".join(data)
 
 
-def gateway_responses_stream(stream, protocol, model):
-    """Translate upstream text deltas immediately into Responses SSE events."""
+def gateway_responses_stream(stream, protocol, model, tool_context=None):
+    """Translate text and indexed tool argument deltas into Responses events."""
     response = {
         "id": "resp_" + uuid.uuid4().hex, "object": "response",
         "created_at": int(time.time()), "model": model, "status": "in_progress",
@@ -970,6 +1225,49 @@ def gateway_responses_stream(stream, protocol, model):
     terminal = False
     finish_reason = None
     usage = {}
+    calls = {}
+    text_index = None
+
+    def tool_events(index, call_delta):
+        state = calls.setdefault(index, {"id": "", "name": "", "arguments": "", "item": None})
+        function = call_delta.get("function") or {}
+        state["id"] += call_delta.get("id") or ""
+        state["name"] += function.get("name") or ""
+        fragment = function.get("arguments") or ""
+        if not isinstance(fragment, str):
+            raise ValueError("upstream tool arguments must be strings")
+        state["arguments"] += fragment
+        # Name/id may themselves arrive in fragments. Wait for arguments before
+        # publishing immutable item metadata. Empty-argument tools start at EOF.
+        if state["item"] is None and state["name"] and state["id"] and state["arguments"]:
+            spec = (tool_context or {}).get(state["name"], {"name": state["name"], "type": "function"})
+            if tool_context is not None and state["name"] not in tool_context:
+                raise ValueError("upstream called an undeclared tool")
+            custom = spec["type"] == "custom"
+            state["custom"] = custom
+            state["search"] = spec["type"] == "tool_search"
+            state["published_name"] = state["name"]
+            state["published_id"] = state["id"]
+            state["item"] = {"id": "fc_" + uuid.uuid4().hex, "type": "custom_tool_call" if custom else "function_call",
+                             "call_id": state["id"], "name": spec["name"], "status": "in_progress",
+                             "input" if custom else "arguments": ""}
+            if spec.get("namespace"):
+                state["item"]["namespace"] = spec["namespace"]
+            if state["search"]:
+                state["item"].pop("name")
+                state["item"].update(type="tool_search_call", execution="client", arguments={})
+            state["output_index"] = len(response["output"])
+            response["output"].append(state["item"])
+            yield emit("response.output_item.added", output_index=state["output_index"], item=state["item"])
+            fragment = state["arguments"]
+        if state["item"] is not None:
+            if state["name"] != state["published_name"] or state["id"] != state["published_id"]:
+                raise ValueError("upstream tool identity changed after arguments began")
+            if fragment and not state["custom"] and not state["search"]:
+                state["item"]["arguments"] += fragment
+                yield emit("response.function_call_arguments.delta", item_id=state["item"]["id"],
+                           output_index=state["output_index"], delta=fragment)
+
     try:
         for data in iter_sse_data(stream):
             if protocol == "openai" and data == "[DONE]":
@@ -979,6 +1277,7 @@ def gateway_responses_stream(stream, protocol, model):
             if not isinstance(chunk, dict) or chunk.get("error") or chunk.get("type") == "error":
                 raise ValueError("upstream stream error")
             text_delta = ""
+            tool_deltas = []
             if protocol == "openai":
                 if chunk.get("usage"):
                     usage.update(chunk["usage"])
@@ -987,7 +1286,8 @@ def gateway_responses_stream(stream, protocol, model):
                         continue
                     delta = choice.get("delta") or {}
                     text_delta += delta.get("content") or ""
-                    if delta.get("tool_calls") or delta.get("refusal"):
+                    tool_deltas.extend((c.get("index", i), c) for i, c in enumerate(delta.get("tool_calls") or []))
+                    if delta.get("refusal"):
                         raise ValueError("unsupported upstream output")
                     finish_reason = choice.get("finish_reason") or finish_reason
             else:
@@ -997,13 +1297,17 @@ def gateway_responses_stream(stream, protocol, model):
                 elif kind == "content_block_start":
                     block = chunk.get("content_block") or {}
                     if block.get("type") == "tool_use":
-                        raise ValueError("unsupported upstream output")
+                        initial = block.get("input")
+                        tool_deltas.append((chunk["index"], {"id": block["id"], "function": {
+                            "name": block["name"], "arguments": json.dumps(initial, ensure_ascii=False) if initial else ""}}))
                     if block.get("type") == "text":
                         text_delta = block.get("text", "")
                 elif kind == "content_block_delta":
                     delta = chunk.get("delta") or {}
                     if delta.get("type") == "text_delta":
                         text_delta = delta.get("text", "")
+                    elif delta.get("type") == "input_json_delta":
+                        tool_deltas.append((chunk["index"], {"function": {"arguments": delta.get("partial_json", "")}}))
                 elif kind == "message_delta":
                     usage.update(chunk.get("usage") or {})
                     finish_reason = chunk.get("delta", {}).get("stop_reason") or finish_reason
@@ -1014,17 +1318,51 @@ def gateway_responses_stream(stream, protocol, model):
                 if item is None:
                     item = {"id": "msg_" + uuid.uuid4().hex, "type": "message",
                             "role": "assistant", "status": "in_progress", "content": []}
+                    text_index = len(response["output"])
                     response["output"].append(item)
-                    yield emit("response.output_item.added", output_index=0, item=item)
+                    yield emit("response.output_item.added", output_index=text_index, item=item)
                     part = {"type": "output_text", "text": "", "annotations": []}
                     item["content"].append(part)
-                    fields = dict(item_id=item["id"], output_index=0, content_index=0)
+                    fields = dict(item_id=item["id"], output_index=text_index, content_index=0)
                     yield emit("response.content_part.added", **fields, part=part)
                 part["text"] += text_delta
                 yield emit("response.output_text.delta", **fields, delta=text_delta)
+            for index, call_delta in tool_deltas:
+                yield from tool_events(index, call_delta)
         if not terminal:
             raise ValueError("upstream stream ended before its terminal event")
-    except (ValueError, OSError, HTTPException):
+        if calls and finish_reason in ("length", "max_tokens", "content_filter"):
+            # Do not emit completed executable calls when arguments are truncated.
+            response["status"] = "incomplete"
+            response["incomplete_details"] = {"reason": "content_filter" if finish_reason == "content_filter" else "max_output_tokens"}
+            for output in response["output"]:
+                output["status"] = "incomplete"
+            yield emit("response.incomplete", response=response)
+            return
+        # Validate ALL calls before publishing any executable completed item.
+        finished = {}
+        for index, state in calls.items():
+            finished[index] = response_tool_item({"id": state["id"], "function": {
+                "name": state["name"], "arguments": state["arguments"] or "{}"}}, tool_context)
+        for index, state in calls.items():
+            if state["item"] is None:
+                yield from tool_events(index, {"function": {"arguments": "{}"}})
+            final = finished[index]
+            target = state["item"]
+            call_fields = {"item_id": target["id"], "output_index": state["output_index"]}
+            if state["search"]:
+                target["arguments"] = final["arguments"]
+            elif state["custom"]:
+                target["input"] = final["input"]
+                yield emit("response.custom_tool_call_input.delta", **call_fields, delta=target["input"])
+                yield emit("response.custom_tool_call_input.done", **call_fields, input=target["input"])
+            else:
+                target["arguments"] = final["arguments"]
+                yield emit("response.function_call_arguments.done", **call_fields,
+                           name=target["name"], arguments=target["arguments"])
+            target["status"] = "completed"
+            yield emit("response.output_item.done", output_index=state["output_index"], item=target)
+    except (ValueError, TypeError, KeyError, OSError, HTTPException):
         # Headers have already been sent; failures must remain SSE events.
         response["status"] = "failed"
         response["error"] = {"code": "upstream_stream_error", "message": "Upstream stream failed or ended unexpectedly"}
@@ -1039,7 +1377,7 @@ def gateway_responses_stream(stream, protocol, model):
         item["status"] = response["status"]
         yield emit("response.output_text.done", **fields, text=part["text"])
         yield emit("response.content_part.done", **fields, part=part)
-        yield emit("response.output_item.done", output_index=0, item=item)
+        yield emit("response.output_item.done", output_index=text_index, item=item)
     input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
     output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
     response["usage"] = {"input_tokens": input_tokens, "output_tokens": output_tokens,
@@ -1123,6 +1461,13 @@ def openai_to_anthropic_request(body):
             continue
         role = msg.get("role", "user")
         content = msg.get("content", "")
+        if role == "tool":
+            block = {"type": "tool_result", "tool_use_id": msg["tool_call_id"], "content": content or ""}
+            if messages and messages[-1]["role"] == "user" and isinstance(messages[-1]["content"], list):
+                messages[-1]["content"].append(block)
+            else:
+                messages.append({"role": "user", "content": [block]})
+            continue
         blocks = None
         if isinstance(content, list):
             blocks = []
@@ -1142,21 +1487,39 @@ def openai_to_anthropic_request(body):
                 content = "".join(block.get("text", "") for block in blocks)
             else:
                 content = blocks
-        if role == "system":
+        if msg.get("tool_calls"):
+            content = ([{"type": "text", "text": content}] if content else []) if isinstance(content, str) or content is None else list(content)
+            for call in msg["tool_calls"]:
+                content.append({"type": "tool_use", "id": call["id"], "name": call["function"]["name"],
+                                "input": json.loads(call["function"].get("arguments") or "{}")})
+        if role in ("system", "developer"):
             if blocks is not None:
-                system_text = "".join(
+                system_text += "".join(
                     block.get("text", "") for block in blocks if block.get("type") == "text"
                 )
             else:
-                system_text = str(content)
+                system_text += str(content)
         else:
-            messages.append({"role": role, "content": content})
+            if role == "user" and messages and messages[-1]["role"] == "user" and isinstance(messages[-1]["content"], list):
+                messages[-1]["content"].extend(content if isinstance(content, list) else [{"type": "text", "text": content}])
+            else:
+                messages.append({"role": role, "content": content})
     result = {"messages": messages}
     if system_text:
         result["system"] = system_text
     for key in ("model", "max_tokens", "temperature", "top_p", "stream"):
         if body.get(key) is not None:
             result[key] = body[key]
+    if body.get("tools"):
+        result["tools"] = [{"name": t["function"]["name"], "description": t["function"].get("description", ""),
+                            "input_schema": t["function"]["parameters"]} for t in body["tools"]]
+        choice = body.get("tool_choice", "auto")
+        if isinstance(choice, dict):
+            result["tool_choice"] = {"type": "tool", "name": choice["function"]["name"]}
+        else:
+            result["tool_choice"] = {"type": "any" if choice == "required" else choice}
+        if body.get("parallel_tool_calls") is False:
+            result["tool_choice"]["disable_parallel_tool_use"] = True
     return result
 
 
@@ -1176,13 +1539,20 @@ def anthropic_response_to_openai(body, model):
         finish = "length"
     elif stop_reason == "tool_use":
         finish = "tool_calls"
+    message = {"role": "assistant", "content": text}
+    if isinstance(content, list):
+        calls = [{"id": c["id"], "type": "function", "function": {
+            "name": c["name"], "arguments": json.dumps(c.get("input", {}), ensure_ascii=False)}}
+            for c in content if isinstance(c, dict) and c.get("type") == "tool_use"]
+        if calls:
+            message["tool_calls"] = calls
     return {
         "id": body.get("id", "chatcmpl-" + uuid.uuid4().hex[:16]),
         "object": "chat.completion",
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": text},
+            "message": message,
             "finish_reason": finish,
         }],
         "usage": {
@@ -1459,6 +1829,35 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def log_message(self, fmt, *args):
+        log.info("%s %s", self.address_string(), fmt % args)
+
+    def handle_logs_get(self):
+        query = dict(parse_qsl(urlparse(self.path).query))
+        if query.get("download"):
+            try:
+                body = LOG_PATH.read_bytes()
+            except OSError:
+                body = b""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="dashboard.log"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        try:
+            limit = int(query.get("lines", "500"))
+        except ValueError:
+            limit = 500
+        limit = max(1, min(limit, 5000))
+        body = tail_log_file(LOG_PATH, limit).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if self.path == "/api/snapshot":
             self.send_json(load_snapshot(self.snapshot_path))
@@ -1491,6 +1890,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/gateway/active":
             self.send_json(gateway_active_snapshot())
+            return
+        if self.path.split("?")[0] == "/api/logs":
+            self.handle_logs_get()
             return
         if self.path.startswith("/api/sms/"):
             self.handle_sms_request("GET")
@@ -1621,6 +2023,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                             definition[_field] = _value
                         elif _field in definition:
                             del definition[_field]
+                    elif _field in existing:
+                        # Fields the request omits keep their stored value, so a
+                        # label-only update cannot wipe sensitive account data.
+                        definition[_field] = existing[_field]
+                if isinstance(existing.get("dashboardHidden"), bool) and existing["dashboardHidden"]:
+                    definition["dashboardHidden"] = True
+                if payload.get("dashboardHidden") is True:
+                    definition["dashboardHidden"] = True
+                elif payload.get("dashboardHidden") is False and "dashboardHidden" in definition:
+                    del definition["dashboardHidden"]
                 if isinstance(existing.get("gateway"), dict):
                     definition["gateway"] = dict(existing["gateway"])
                 if "gateway" in payload and isinstance(payload["gateway"], dict):
@@ -1660,7 +2072,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             accounts = load_requests(self.requests_path)
             for account_id, definition in accounts.items():
                 source = definition.get("source", "")
-                if should_skip_source(source, accounts):
+                if definition.get("dashboardHidden") is True or should_skip_source(source, accounts):
                     continue
                 try:
                     if source in VOLC_ACTIONS:
@@ -1736,7 +2148,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _gateway_stream_openai(self, base_url, path, api_key, body_bytes, protocol="openai", output_protocol=None, model=""):
+    def _gateway_stream_openai(self, base_url, path, api_key, body_bytes, protocol="openai", output_protocol=None, model="", tool_context=None):
         """Make upstream request and stream SSE response back to client in real-time."""
         url = base_url.rstrip("/") + path
         headers = {
@@ -1784,7 +2196,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         # Stream chunks from upstream to client
         try:
             if output_protocol == "responses":
-                for event in gateway_responses_stream(resp, protocol, model):
+                for event in gateway_responses_stream(resp, protocol, model, tool_context):
                     self.wfile.write(event)
                     self.wfile.flush()
                 return True
@@ -1813,9 +2225,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             body, _raw = self._gateway_read_body()
             if not isinstance(body, dict):
                 raise ValueError("request body must be a JSON object")
-        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-            self.send_error(400, str(exc))
+            tool_context = {} if inbound_format == "responses" else None
+            responses_body = responses_to_openai(body, tool_context) if inbound_format == "responses" else None
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            self._gateway_write_json(400, {"error": {"type": "invalid_request_error", "message": str(exc)}})
             return
+        platform = detect_gateway_agent_platform(self.headers)
 
         accounts = load_requests(self.requests_path)
         snapshot = load_snapshot(self.snapshot_path)
@@ -1823,9 +2238,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         stream = bool(body.get("stream", False))
         model = body.get("model") or config.get("defaultModel", "")
         last_error = ""
+        started = time.monotonic()
+        log.info("gw request %s model=%s stream=%s protocol=%s platform=%s",
+                 self.path, model or "-", stream, inbound_format, platform or "-")
 
         for _attempt in range(max_retries):
-            with reserve_gateway_account(accounts, snapshot, model, inbound_format, stream) as (aid, acc):
+            with reserve_gateway_account(accounts, snapshot, model, inbound_format, stream, platform) as (aid, acc):
                 if not aid:
                     d = self._gateway_diagnostics(accounts)
                     msg = "no available gateway accounts (accounts may be at concurrency limit, cooling down, or out of quota; total %d, disabled %d, missing apiKey %d)" % (
@@ -1833,6 +2251,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     )
                     if last_error:
                         msg += "; last: " + last_error
+                    self.log_gateway_unavailable(accounts, snapshot, last_error)
                     self.send_error(503, msg)
                     return
                 gw = acc.get("gateway") or {}
@@ -1850,7 +2269,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     upstream_protocol = "openai" if desired_protocol == "anthropic" else "anthropic"
                 if not base_url:
                     last_error = "upstream %s has no baseUrl configured" % category
-                    cooldown_account(aid, 30)
+                    cooldown_account(aid, 30, "upstream %s has no baseUrl configured" % category)
                     continue
                 upstream_key = str(acc.get("apiKey", "")).strip()
 
@@ -1862,13 +2281,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 elif inbound_format == "anthropic" and upstream_protocol == "openai":
                     upstream_body = anthropic_to_openai(body)
                 elif inbound_format == "responses" and upstream_protocol == "openai":
-                    upstream_body = responses_to_openai(body)
+                    upstream_body = dict(responses_body)
                 elif inbound_format == "responses" and upstream_protocol == "anthropic":
-                    upstream_body = openai_to_anthropic_request(responses_to_openai(body))
+                    upstream_body = openai_to_anthropic_request(responses_body)
                 else:
                     upstream_body = dict(body)
                 if not upstream_body.get("model") and model:
                     upstream_body["model"] = model
+                if platform and "codex" in platform.lower() \
+                        and upstream_protocol == "openai" and category in {"agentPlan", "codingPlan"}:
+                    upstream_body = normalize_volcengine_image_detail(upstream_body)
                 # Upstream path
                 if upstream_protocol == "anthropic":
                     upstream_path = "/v1/messages"
@@ -1886,14 +2308,15 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
                 # True SSE streaming: bypass buffering, stream directly
                 if native_stream or responses_stream:
-                    record_gateway_request(aid)
+                    record_gateway_request(aid, platform)
                     try:
                         self._gateway_stream_openai(base_url, upstream_path, upstream_key, upstream_bytes,
-                                                    upstream_protocol, inbound_format, model)
+                                                    upstream_protocol, inbound_format, model, tool_context)
                     except GatewayRetry as error:
-                        cooldown_account(aid)
+                        cooldown_account(aid, reason=str(error))
                         last_error = str(error)
                         continue
+                    log.info("gw stream complete via %s in %.1fs", aid, time.monotonic() - started)
                     return
 
                 status, resp, err = gateway_send_upstream(
@@ -1902,13 +2325,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 )
                 if resp is None:
                     last_error = err or "upstream connection failed"
-                    cooldown_account(aid, 30)
+                    cooldown_account(aid, 30, last_error)
                     continue
 
                 try:
                     resp_body = resp.read()
                 except (OSError, HTTPException):
-                    cooldown_account(aid, 30)
+                    cooldown_account(aid, 30, "upstream response interrupted")
                     last_error = "upstream response interrupted"
                     continue
                 finally:
@@ -1917,9 +2340,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
                 if status != 200:
                     if is_quota_exhausted(status, resp_text):
-                        cooldown_account(aid)
+                        log.warning("gw account %s upstream HTTP %d quota-like: %.200s", aid, status, resp_text)
+                        cooldown_account(aid, reason="upstream HTTP %d quota-like" % status)
                         last_error = "account %s quota exhausted (HTTP %d)" % (aid, status)
                         continue
+                    log.info("gw upstream HTTP %d passthrough (account %s)", status, aid)
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("Content-Length", str(len(resp_body)))
@@ -1927,7 +2352,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     self.wfile.write(resp_body)
                     return
 
-                record_gateway_request(aid)
+                record_gateway_request(aid, platform)
 
                 # ---- Response conversion: upstream -> inbound protocol ----
                 try:
@@ -1945,7 +2370,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     out = openai_to_anthropic(upstream_json, out_model) if isinstance(upstream_json, dict) else None
                     out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
                 elif upstream_protocol == "openai" and inbound_format == "responses":
-                    out = openai_to_responses(upstream_json, out_model) if isinstance(upstream_json, dict) else None
+                    try:
+                        out = openai_to_responses(upstream_json, out_model, tool_context) if isinstance(upstream_json, dict) else None
+                    except (ValueError, TypeError, KeyError):
+                        self._gateway_write_json(502, {"error": {"message": "invalid upstream tool call"}})
+                        return
                     out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
                 elif upstream_protocol == "anthropic" and inbound_format == "openai":
                     out = anthropic_response_to_openai(upstream_json, out_model) if isinstance(upstream_json, dict) else None
@@ -1953,7 +2382,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 elif upstream_protocol == "anthropic" and inbound_format == "responses":
                     if isinstance(upstream_json, dict):
                         oa = anthropic_response_to_openai(upstream_json, out_model)
-                        out = openai_to_responses(oa, out_model)
+                        try:
+                            out = openai_to_responses(oa, out_model, tool_context)
+                        except (ValueError, TypeError, KeyError):
+                            self._gateway_write_json(502, {"error": {"message": "invalid upstream tool call"}})
+                            return
                         out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8")
                     else:
                         out_bytes = resp_body
@@ -1969,6 +2402,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(out_bytes)))
                 self.end_headers()
                 self.wfile.write(out_bytes)
+                log.info("gw request complete via %s (upstream %s) in %.1fs",
+                         aid, upstream_protocol, time.monotonic() - started)
                 return
 
         self.send_error(503, "all gateway accounts exhausted: " + last_error)
@@ -1995,6 +2430,42 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "noApiKey": no_key,
         }
 
+    def log_gateway_unavailable(self, accounts, snapshot, last_error):
+        """Persist per-account routing state so recurring 503s can be diagnosed from logs."""
+        routing = gateway_routing_snapshot(snapshot)
+        now = time.time()
+        with _gateway_active_lock:
+            active_counts = {}
+            for entry in _gateway_active.values():
+                active_counts[entry["accountId"]] = active_counts.get(entry["accountId"], 0) + 1
+        details = []
+        for aid, acc in accounts.items():
+            if not isinstance(acc, dict):
+                continue
+            gw = acc.get("gateway") or {}
+            if gw.get("enabled") is False:
+                details.append("%s: gateway disabled" % aid)
+                continue
+            if not str(acc.get("apiKey", "")).strip():
+                details.append("%s: missing apiKey" % aid)
+                continue
+            cooling = _gateway_cooldowns.get(aid, 0)
+            if now < cooling:
+                details.append("%s: cooling down %.0fs" % (aid, cooling - now))
+                continue
+            active = active_counts.get(aid, 0)
+            limit = gateway_concurrency_limit(acc)
+            if active >= limit:
+                details.append("%s: at concurrency limit %d/%d" % (aid, active, limit))
+                continue
+            remaining = account_remaining_percent(aid, routing)
+            if remaining <= 0:
+                details.append("%s: out of quota" % aid)
+                continue
+            details.append("%s: available (%.0f%% quota, %d active)" % (aid, remaining, active))
+        log.warning("gw 503 no available accounts [%s]; last error: %s",
+                    "; ".join(details), last_error or "none")
+
     def handle_gateway_models(self):
         config = load_gateway_config()
         if not config.get("enabled"):
@@ -2011,6 +2482,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             msg = "no available gateway accounts (total %d, disabled %d, missing apiKey %d)" % (
                 d["total"], d["disabled"], d["noApiKey"]
             )
+            self.log_gateway_unavailable(accounts, snapshot, "")
             self.send_error(503, msg)
             return
         gw = acc.get("gateway") or {}
@@ -2332,9 +2804,20 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 _active_dashboard_server = {"httpd": None}
 
 
+class DashboardServer(ThreadingHTTPServer):
+    """Route unhandled handler-thread errors into the persistent log."""
+
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            log.info("client disconnected %s", client_address[0])
+        else:
+            log.error("request handler error from %s: %s", client_address[0], error, exc_info=True)
+
+
 def bind_dashboard_server(port, host="0.0.0.0"):
     """Bind the dashboard listener without serving; raises OSError when the port is taken."""
-    return ThreadingHTTPServer((host, port), DashboardHandler)
+    return DashboardServer((host, port), DashboardHandler)
 
 
 def activate_dashboard_server(httpd, retire=None):
@@ -2356,12 +2839,15 @@ if __name__ == "__main__":
     quota_stop = Event()
     Thread(target=gateway_quota_worker, args=(DashboardHandler.requests_path, quota_stop), daemon=True).start()
     activate_dashboard_server(httpd)
+    log.info("dashboard listening on %s:%s (pid %d, log file %s)",
+             httpd.server_address[0], httpd.server_address[1], os.getpid(), LOG_PATH)
     try:
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
         pass
     finally:
+        log.info("dashboard shutting down")
         quota_stop.set()
         current = _active_dashboard_server["httpd"]
         if current is not None:

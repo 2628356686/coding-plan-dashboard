@@ -99,6 +99,7 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
 .copy-btn{background:none;border:none;cursor:pointer;color:var(--muted);font-size:12px;padding:2px 5px;margin-left:4px;border-radius:5px;opacity:.6;transition:all .15s}
 .copy-btn:hover{color:var(--text);background:#ffffff12;opacity:1}
 .copy-btn.copied{color:var(--good);opacity:1}
+.logs-pre{background:#0d1117;color:#c9d1d9;border-radius:10px;padding:14px;font:12px/1.6 Consolas,Menlo,monospace;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0 0 10px}
 </style>
 </head>
 <body>
@@ -113,6 +114,7 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
       <a onclick="switchPage('accounts',this)"><span class="icon">👤</span>账号管理</a>
       <a onclick="switchPage('sms',this)"><span class="icon">📱</span>接码管理</a>
       <a onclick="switchPage('gateway',this)"><span class="icon">🌐</span>网关管理</a>
+      <a onclick="switchPage('logs',this)"><span class="icon">📋</span>运行日志</a>
     </nav>
   </aside>
   <div class="main-content">
@@ -181,8 +183,8 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
           <p class="hint" id="gwActiveHint" aria-live="polite">每秒自动更新，显示正在处理请求的账号和模型</p>
           <div class="accounts-table-wrap">
             <table class="accounts-table">
-              <thead><tr><th>账号</th><th>模型</th><th>接口协议</th><th>输出方式</th><th>已持续</th></tr></thead>
-              <tbody id="gwActiveTbody"><tr><td colspan="5" style="text-align:center;color:var(--muted)">加载中…</td></tr></tbody>
+              <thead><tr><th>账号</th><th>使用平台</th><th>模型</th><th>接口协议</th><th>输出方式</th><th>已持续</th></tr></thead>
+              <tbody id="gwActiveTbody"><tr><td colspan="6" style="text-align:center;color:var(--muted)">加载中…</td></tr></tbody>
             </table>
           </div>
         </div>
@@ -246,6 +248,21 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
               <tbody id="smsPhoneTbody"><tr><td colspan="10" style="text-align:center;color:var(--muted)">暂无号码，请在上方取号。</td></tr></tbody>
             </table>
           </div>
+        </div>
+      </section>
+      <section id="page-logs" class="page">
+        <div class="page-header">
+          <div><h2>运行日志</h2><p>查看服务端持久化日志，排查网关 503、账号冷却、配额刷新失败等问题</p></div>
+          <button class="btn primary" id="logsRefreshBtn" onclick="logsLoad()">刷新日志</button>
+        </div>
+        <div class="panel">
+          <div class="source-body">
+            <div class="field"><label>行数</label><select id="logLines"><option>200</option><option selected>500</option><option>1000</option><option>2000</option></select></div>
+            <div class="field"><label>自动刷新</label><select id="logAuto" onchange="logsSetAuto()"><option value="0">关闭</option><option value="5" selected>每 5 秒</option><option value="15">每 15 秒</option><option value="60">每 60 秒</option></select></div>
+            <div class="field"><label>完整日志</label><a class="btn" href="/api/logs?download=1" style="text-align:center">下载日志文件</a></div>
+          </div>
+          <pre class="logs-pre" id="logsPre">加载中…</pre>
+          <p class="hint">日志路径由 LOG_PATH 环境变量决定：本机用 start.bat 运行时写入项目 <code>log/</code> 目录，Docker 部署写入 <code>/data/dashboard.log</code>。按 5 MB 滚动、保留 5 份备份；此处显示当前文件的最后 N 行，最新在底部。</p>
         </div>
       </section>
     </main>
@@ -337,7 +354,7 @@ function fmtCookieExpiry(expires){
 }
 function render(){
   mergeCodexNewApiCredits();
-  const accounts=getOrderedAccounts().filter(([,acc])=>acc.source!=='codexNewApiCredits');
+  const accounts=getOrderedAccounts().filter(([,acc])=>acc.source!=='codexNewApiCredits'&&!acc.dashboardHidden);
   const items=accounts.map(([id])=>state[id]).filter(Boolean);
   const total=items.reduce((sum,item)=>sum+num(item.limit),0),used=items.reduce((sum,item)=>sum+num(item.used),0);
   const summary=[['账号数',`${accounts.length}`,'已保存'],['总限额',total?total.toLocaleString():'-','合计'],['已使用',used?used.toLocaleString():'-','合计'],['最近更新',items.length?fmtDate(items.map(x=>x.updatedAt).filter(Boolean).sort().at(-1)):'-','本机时间']];
@@ -354,7 +371,7 @@ function render(){
     const googleCredsBtn=(acc.source==='googleAi')?`<button class="btn" onclick="editGoogleCreds('${id}')">更新 Token</button>`:'';
     const reorderHtml=`<div class="reorder-btns"><button onclick="moveAccount('${id}',-1)" title="上移">▲</button><button onclick="moveAccount('${id}',1)" title="下移">▼</button></div>`;
     const cookieHtml = acc.cookieExpires ? `<div><b>${fmtCookieExpiry(acc.cookieExpires)}</b><span>登录态有效期</span></div>` : '';
-    const actionsHtml=`<div class="card-actions">${googleCredsBtn}<button class="btn" onclick="editLabel('${id}')">编辑备注</button><button class="btn danger" onclick="deleteAccount('${id}')">删除</button></div>${reorderHtml}`;
+    const actionsHtml=`<div class="card-actions">${googleCredsBtn}<button class="btn" onclick="editLabel('${id}')">编辑备注</button><button class="btn danger" onclick="deleteAccount('${id}',true)">删除</button></div>${reorderHtml}`;
     if(periods){
       return `<article class="card${staleClass}"><div class="card-head"><div class="brand"><div class="logo ${source.className}">${source.logo}</div><div><h2>${source.name}</h2><p>${source.sub}</p>${labelDisplay}</div></div><span class="badge ${kind}">${label}</span></div>${actionsHtml}<div class="period-list">${periods}</div>${staleNote}<div class="details">${cookieHtml}<div><b>${item?fmtDate(item.updatedAt):'-'}</b><span>数据更新时间</span></div></div></article>`
     }
@@ -365,9 +382,9 @@ function render(){
   if(document.getElementById('accountsTableContainer')) renderAccountsTable();
 }
 async function loadRequests(){try{const [accRes,orderRes]=await Promise.all([fetch('/api/requests'),fetch('/api/order')]);if(accRes.ok){const data=await accRes.json();requestDefinitions=data||{}}if(orderRes.ok){const data=await orderRes.json();const ids=Object.keys(requestDefinitions);accountOrder=Array.isArray(data.order)?data.order.filter(id=>ids.includes(id)):[]}else{accountOrder=[]}}catch{requestDefinitions={};accountOrder=[]}}
-async function loadCachedResults(){try{const response=await fetch('/api/results');if(!response.ok)return;const results=await response.json();for(const [id,result] of Object.entries(results)){if(!result?.ok||!result.body)continue;try{const acc=requestDefinitions[id];if(!acc)continue;const payload=JSON.parse(result.body),part=parseForAccount(acc.source,payload),updatedAt=result.updatedAt||part.updatedAt;part.updatedAt=updatedAt;state[id]=part}catch(error){console.error(`failed to parse cached ${id}`,error)}}mergeCodexNewApiCredits()}catch(error){console.error('cached quota results unavailable',error)}}
+async function loadCachedResults(){try{const response=await fetch('/api/results');if(!response.ok)return;const results=await response.json();for(const [id,result] of Object.entries(results)){if(!result?.ok||!result.body)continue;try{const acc=requestDefinitions[id];if(!acc||acc.dashboardHidden)continue;const payload=JSON.parse(result.body),part=parseForAccount(acc.source,payload),updatedAt=result.updatedAt||part.updatedAt;part.updatedAt=updatedAt;state[id]=part}catch(error){console.error(`failed to parse cached ${id}`,error)}}mergeCodexNewApiCredits()}catch(error){console.error('cached quota results unavailable',error)}}
 let refreshInFlight=false;
-async function refreshFromServer(){if(refreshInFlight)return;refreshInFlight=true;try{const response=await fetch('/api/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!response.ok){refreshErrors.__request={status:response.status};render();throw new Error(`HTTP ${response.status}`)}delete refreshErrors.__request;const results=await response.json();for(const [id,result] of Object.entries(results)){const acc=requestDefinitions[id];if(!acc)continue;if(!result.ok||result.status!==200){refreshErrors[id]={status:result.status,error:result.error};continue}delete refreshErrors[id];try{const payload=JSON.parse(result.body),part=parseForAccount(acc.source,payload),updatedAt=result.updatedAt||now();part.updatedAt=updatedAt;state[id]=part}catch(error){refreshErrors[id]={status:result.status,error:error.message};console.error(`failed to parse ${id}`,error)}}mergeCodexNewApiCredits();await save();render()}catch(error){console.error('quota refresh failed',error);render()}finally{refreshInFlight=false}}
+async function refreshFromServer(){if(refreshInFlight)return;refreshInFlight=true;try{const response=await fetch('/api/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!response.ok){refreshErrors.__request={status:response.status};render();throw new Error(`HTTP ${response.status}`)}delete refreshErrors.__request;const results=await response.json();for(const [id,result] of Object.entries(results)){const acc=requestDefinitions[id];if(!acc||acc.dashboardHidden)continue;if(!result.ok||result.status!==200){refreshErrors[id]={status:result.status,error:result.error};continue}delete refreshErrors[id];try{const payload=JSON.parse(result.body),part=parseForAccount(acc.source,payload),updatedAt=result.updatedAt||now();part.updatedAt=updatedAt;state[id]=part}catch(error){refreshErrors[id]={status:result.status,error:error.message};console.error(`failed to parse ${id}`,error)}}mergeCodexNewApiCredits();await save();render()}catch(error){console.error('quota refresh failed',error);render()}finally{refreshInFlight=false}}
 async function saveCurl(){if(locked){lockedAlert();return;}const curl=$('#curlInput').value.trim();if(!curl){alert('请先粘贴原始 curl 请求');return}const label=$('#labelInput').value.trim();try{const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({curl,label,updatedAt:now()})});if(!response.ok){let msg=`HTTP ${response.status}`;try{const err=await response.json();if(err.error)msg=err.error}catch(e){}throw new Error(msg)}const result=await response.json();const _newAcc={source:result.source,label,curl,updatedAt:now()};
     if(result.accountId) _newAcc.accountId=result.accountId;
     if(result.cookieExpires) _newAcc.cookieExpires=result.cookieExpires;
@@ -375,7 +392,36 @@ async function saveCurl(){if(locked){lockedAlert();return;}const curl=$('#curlIn
 async function addGoogleAccount(){if(locked){lockedAlert();return;}const label=$('#googleLabel').value.trim();const refreshToken=$('#googleRefreshToken').value.trim();const proxy=$('#googleProxy').value.trim();if(!refreshToken){alert('请填写 OAuth Refresh Token');return}try{const body={source:'googleAi',label,refreshToken,updatedAt:now()};if(proxy)body.proxy=proxy;const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok)throw new Error(await response.text());const result=await response.json();requestDefinitions[result.id]={source:result.source,label,refreshToken:refreshToken.slice(0,4)+'****',hasCreds:true,curl:'',proxy,updatedAt:now()};$('#googleLabel').value='';$('#googleRefreshToken').value='';$('#googleProxy').value='';render();await refreshFromServer()}catch(error){alert(`创建 Google AI 账号失败：${error.message}`)}}
 async function saveLabel(id,label){if(locked){lockedAlert();return;}try{const acc=requestDefinitions[id];if(!acc)return;const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,label,curl:acc.curl,updatedAt:now()})});if(!response.ok)throw new Error(await response.text());requestDefinitions[id]={...acc,label};render()}catch(error){alert(`保存备注失败：${error.message}`)}}
 function editLabel(id){if(locked){lockedAlert();return;}const acc=requestDefinitions[id];if(!acc)return;const cards=document.querySelectorAll('#cards .card');for(const card of cards){const btn=card.querySelector('.card-actions button');if(btn&&btn.getAttribute('onclick')&&btn.getAttribute('onclick').includes(id)){const brandDiv=card.querySelector('.brand > div:last-child');if(brandDiv){const currentLabel=acc.label||'';brandDiv.insertAdjacentHTML('beforeend',`<div class="label-edit"><input type="text" value="${escapeHtml(currentLabel)}" placeholder="输入备注"><button class="save" onclick="saveLabel('${id}',this.previousElementSibling.value)">保存</button></div>`);brandDiv.querySelector('.label-edit input')?.focus()}break}}}
-async function deleteAccount(id){if(locked){lockedAlert();return;}const acc=requestDefinitions[id];if(!acc)return;const name=`${SOURCES[acc.source]?.name||acc.source}${acc.label?' · '+acc.label:''}`;if(!confirm(`确认删除账号「${name}」？\n\n删除后不可恢复，该账号的 curl 和缓存数据将被清除。`))return;try{const response=await fetch('/api/requests',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});if(!response.ok)throw new Error(await response.text());delete requestDefinitions[id];delete state[id];delete refreshErrors[id];render()}catch(error){alert(`删除失败：${error.message}`)}}
+async function deleteAccount(id,soft){
+  if(locked){lockedAlert();return;}
+  const acc=requestDefinitions[id];if(!acc)return;
+  const name=`${SOURCES[acc.source]?.name||acc.source}${acc.label?' · '+acc.label:''}`;
+  const message=soft?`确认从仪表盘移除「${name}」？\n\n账号管理页会保留该账号资料，但其 API Key 将被清空；之后可在账号管理页恢复显示或彻底删除。`:`确认删除账号「${name}」？\n\n删除后不可恢复，该账号的 curl 和缓存数据将被清除。`;
+  if(!confirm(message))return;
+  try{
+    if(soft){
+      const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,label:acc.label||'',curl:acc.curl,updatedAt:now(),apiKey:'',dashboardHidden:true})});
+      if(!response.ok)throw new Error(await response.text());
+      requestDefinitions[id]={...acc,apiKey:'',dashboardHidden:true};
+    }else{
+      const response=await fetch('/api/requests',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+      if(!response.ok)throw new Error(await response.text());
+      delete requestDefinitions[id];
+    }
+    delete state[id];delete refreshErrors[id];
+    render();renderAccountsTable();
+  }catch(error){alert(`${soft?'移除':'删除'}失败：${error.message}`)}
+}
+async function restoreAccount(id){
+  if(locked){lockedAlert();return;}
+  const acc=requestDefinitions[id];if(!acc)return;
+  try{
+    const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,label:acc.label||'',curl:acc.curl,updatedAt:now(),dashboardHidden:false})});
+    if(!response.ok)throw new Error(await response.text());
+    const next={...acc};delete next.dashboardHidden;requestDefinitions[id]=next;
+    render();renderAccountsTable();
+  }catch(error){alert(`恢复失败：${error.message}`)}
+}
 async function importCurrent(){alert('JSON 导入功能在多账号模式下暂不可用，请使用 curl 导入并刷新')}
 function editGoogleCreds(id){if(locked){lockedAlert();return;}const acc=requestDefinitions[id];if(!acc)return;const card=[...document.querySelectorAll('#cards .card')].find(c=>{const b=c.querySelector('.card-actions button');return b&&b.getAttribute('onclick')&&b.getAttribute('onclick').includes(id)});if(!card)return;let box=card.querySelector('.creds-edit');if(box){box.remove();return}box=document.createElement('div');box.className='creds-edit';box.innerHTML=`<input type="password" placeholder="OAuth Refresh Token（留空保持不变）"><input type="text" placeholder="代理（可选）" value="${escapeHtml(acc.proxy||'')}"><div class="actions"><button class="btn primary" onclick="saveGoogleCreds('${id}',this.parentElement.previousElementSibling.previousElementSibling.value,this.parentElement.previousElementSibling.value)">保存</button></div>`;card.querySelector('.period-list')?.after(box);box.querySelector('input')?.focus()}
 async function saveGoogleCreds(id,refreshToken,proxy){if(locked){lockedAlert();return;}try{const acc=requestDefinitions[id];if(!acc)return;const body={id,label:acc.label||'',curl:acc.curl,updatedAt:now()};if(refreshToken)body.refreshToken=refreshToken;if(proxy)body.proxy=proxy;const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok)throw new Error(await response.text());requestDefinitions[id]={...acc,hasCreds:true,proxy:proxy||acc.proxy};render();await refreshFromServer()}catch(error){alert(`保存 Token 失败：${error.message}`)}}
@@ -384,7 +430,7 @@ function lockedAlert(){
 }
 function toggleLock(){locked=!locked;const btn=$('#lockToggle');if(locked){btn.textContent='🔒';btn.classList.remove('unlocked');btn.title='已锁定，点击解锁编辑';document.body.classList.add('locked')}else{btn.textContent='🔓';btn.classList.add('unlocked');btn.title='已解锁，可编辑备注/删除/排序';document.body.classList.remove('locked')}render()}
 function getOrderedAccounts(){const seen=new Set();const ordered=[];for(const id of accountOrder){if(requestDefinitions[id]&&!seen.has(id)){ordered.push([id,requestDefinitions[id]]);seen.add(id)}}for(const[id,acc] of Object.entries(requestDefinitions)){if(!seen.has(id)){ordered.push([id,acc]);seen.add(id)}}return ordered}
-function moveAccount(id,dir){if(locked){lockedAlert();return;}const ordered=getOrderedAccounts();const idx=ordered.findIndex(([aid])=>aid===id);if(idx<0)return;const target=idx+dir;if(target<0||target>=ordered.length)return;const tmp=ordered[idx];ordered[idx]=ordered[target];ordered[target]=tmp;accountOrder=ordered.map(([aid])=>aid);saveOrder();render()}
+function moveAccount(id,dir){if(locked){lockedAlert();return;}const ordered=getOrderedAccounts().filter(([,acc])=>!acc.dashboardHidden);const idx=ordered.findIndex(([aid])=>aid===id);if(idx<0)return;const target=idx+dir;if(target<0||target>=ordered.length)return;const tmp=ordered[idx];ordered[idx]=ordered[target];ordered[target]=tmp;accountOrder=ordered.map(([aid])=>aid);saveOrder();render()}
 async function saveOrder(){try{await fetch('/api/order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order:accountOrder})})}catch{}}
 $('#refreshAll').onclick=()=>refreshFromServer();$('#lockToggle').onclick=toggleLock;$('#saveCurl').onclick=saveCurl;$('#importPayload').onclick=importCurrent;$('#fetchCurrent').onclick=()=>refreshFromServer();$('#clearData').onclick=async()=>{if(locked){alert('请先解锁编辑（点击右上角 🔒 图标）');return}if(!confirm('确认清除所有本地缓存数据？\n\n服务器保存的账号配置和最后一次成功的查询结果不会被清除。'))return;localStorage.removeItem('coding-plan-quota-snapshot');Object.keys(state).forEach(key=>delete state[key]);await save();render()};$('#addGoogleAccount').onclick=addGoogleAccount;setInterval(updateWaits,1000);setInterval(()=>{if(!document.hidden)refreshFromServer()},60000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshFromServer()});(async()=>{document.body.classList.add('locked');await load();render();await loadRequests();await loadCachedResults();render();await refreshFromServer();render()})();
 
@@ -399,6 +445,24 @@ function switchPage(pageId, el){
   gwStopActivePolling();
   if(pageId==='gateway'){gwLoadConfig();gwPollActive();}
   if(pageId==='sms'){smsLoadPage();}
+  if(pageId==='logs'){logsLoad();logsSetAuto();}
+  else if(logsTimer){clearInterval(logsTimer);logsTimer=null}
+}
+let logsTimer=null;
+async function logsLoad(){
+  const pre=$('#logsPre');const lines=$('#logLines').value;
+  try{
+    const r=await fetch('/api/logs?lines='+lines);
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const text=await r.text();
+    pre.textContent=text||'（暂无日志）';
+    pre.scrollTop=pre.scrollHeight;
+  }catch(e){pre.textContent='日志加载失败：'+e.message}
+}
+function logsSetAuto(){
+  if(logsTimer){clearInterval(logsTimer);logsTimer=null}
+  const v=Number($('#logAuto').value);
+  if(v>0)logsTimer=setInterval(()=>{if(!document.hidden)logsLoad()},v*1000);
 }
 function copyText(text, btn){
   if(!text) return;
@@ -448,7 +512,7 @@ function renderAccountsTable(){
     const src=SOURCES[acc.source]||{name:acc.source,sub:'',logo:'?',className:''};
     const cookieStr=acc.cookieExpires?fmtCookieExpiry(acc.cookieExpires):dash;
     const updatedAt=state[id]&&state[id].updatedAt?fmtDate(state[id].updatedAt):'<span style="color:var(--muted)">未刷新</span>';
-    const label=acc.label?escapeHtml(acc.label):dash;
+    const label=(acc.label?escapeHtml(acc.label):dash)+(acc.dashboardHidden?' <span style="color:var(--muted);font-size:12px">已移出仪表盘</span>':'');
     const _cb=(t)=>t&&t!==dash?`<button class="copy-btn" onclick="copyText(this.dataset.v,this)" data-v="${t.replace(/"/g,'&quot;')}" title="复制">📋</button>`:'';
     const phone=acc.phone?escapeHtml(acc.phone)+_cb(acc.phone):dash;
     const username=acc.username?escapeHtml(acc.username)+_cb(acc.username):dash;
@@ -459,7 +523,8 @@ function renderAccountsTable(){
     const hasKey=!!(acc.apiKey&&acc.apiKey.trim());
     const enabled=hasKey&&acc.gateway?.enabled!==false;
     const gatewaySwitch=`<button type="button" class="gateway-switch" role="switch" aria-checked="${enabled}" aria-label="网关转发" title="${hasKey?'网关转发开关':'缺少 API Key，无法开启网关'}" ${(!hasKey||gatewayTogglePending.has(id))?'disabled':''} data-account-id="${escapeHtml(id)}" onclick="toggleAccountGateway(this.dataset.accountId)"><span class="gateway-switch-track" aria-hidden="true"></span><span>${enabled?'开启':'关闭'}</span></button>`;
-    return `<tr><td><div class="platform"><div class="logo ${src.className}">${src.logo}</div><div class="name">${escapeHtml(sourceName)}</div></div></td><td>${label}</td><td>${phone}</td><td>${username}</td><td>${password}</td><td>${accountId}</td><td>${apiKey}</td><td>${cookieStr}</td><td style="color:var(--muted)">${updatedAt}</td><td>${gatewaySwitch}</td><td><button class="btn" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="editAccountFromTable('${id}')">编辑</button><button class="btn danger" style="padding:4px 10px;font-size:12px" onclick="deleteAccount('${id}')">删除</button></td></tr>`;
+    const ops=`${acc.dashboardHidden?`<button class="btn" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="restoreAccount('${id}')">恢复</button>`:''}<button class="btn" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="editAccountFromTable('${id}')">编辑</button><button class="btn danger" style="padding:4px 10px;font-size:12px" onclick="deleteAccount('${id}')">删除</button>`;
+    return `<tr><td><div class="platform"><div class="logo ${src.className}">${src.logo}</div><div class="name">${escapeHtml(sourceName)}</div></div></td><td>${label}</td><td>${phone}</td><td>${username}</td><td>${password}</td><td>${accountId}</td><td>${apiKey}</td><td>${cookieStr}</td><td style="color:var(--muted)">${updatedAt}</td><td>${gatewaySwitch}</td><td>${ops}</td></tr>`;
   }).join('');
   container.innerHTML=`<div class="accounts-table-wrap"><table class="accounts-table"><thead><tr><th>平台</th><th>备注</th><th>手机号</th><th>用户名</th><th>密码</th><th>AccountID</th><th>API Key</th><th>登录态有效期</th><th>数据更新时间</th><th>网关启用</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
@@ -530,13 +595,13 @@ async function gwPollActive(){
     document.getElementById('gwActiveTbody').innerHTML=requests.length?requests.map(item=>{
       const seconds=Math.floor(Number(item.elapsedSeconds)||0);
       const duration=seconds<60?seconds+' 秒':Math.floor(seconds/60)+' 分 '+seconds%60+' 秒';
-      return `<tr><td><strong>${escapeHtml(item.accountLabel||item.accountId)}</strong></td><td>${escapeHtml(item.model||'未指定模型')}</td><td>${escapeHtml(protocols[item.protocol]||item.protocol||'—')}</td><td>${item.stream?'流式':'非流式'}</td><td>${duration}</td></tr>`;
-    }).join(''):'<tr><td colspan="5" style="text-align:center;color:var(--muted)">当前没有正在处理的请求</td></tr>';
+      return `<tr><td><strong>${escapeHtml(item.accountLabel||item.accountId)}</strong></td><td>${escapeHtml(item.platform||'未知')}</td><td>${escapeHtml(item.model||'未指定模型')}</td><td>${escapeHtml(protocols[item.protocol]||item.protocol||'—')}</td><td>${item.stream?'流式':'非流式'}</td><td>${duration}</td></tr>`;
+    }).join(''):'<tr><td colspan="6" style="text-align:center;color:var(--muted)">当前没有正在处理的请求</td></tr>';
   }catch(e){
     if(gwActiveController!==controller) return;
     document.getElementById('gwActiveCount').textContent='—';
     document.getElementById('gwActiveHint').textContent='状态更新失败，正在自动重试';
-    document.getElementById('gwActiveTbody').innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--muted)">暂时无法获取当前并发</td></tr>';
+    document.getElementById('gwActiveTbody').innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--muted)">暂时无法获取当前并发</td></tr>';
   }finally{
     clearTimeout(timeout);
     if(gwActiveController===controller){

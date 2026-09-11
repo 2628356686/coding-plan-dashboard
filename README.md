@@ -41,6 +41,23 @@ AgentPlan、Kimi Code、LongCat、千问 AI 和 Google AI (Gemini 3.5 Flash)。�
 - Self-contained single-file browser UI (`index.html`) with a custom SVG logo and no
   external favicon dependency.
 
+## Responses gateway compatibility
+
+The `/responses` and `/v1/responses` routes translate to the configured Chat or
+Anthropic upstream. They support function definitions, named tool choice,
+parallel tool calls, tool-result history, and screenshot results, with both JSON
+and incremental SSE responses. Namespaced tools are mapped to stable upstream
+names and restored on return. Custom text tools use a JSON `input` string wrapper;
+their grammar is supplied as instructions, not enforced by the Chat API.
+Client-executed tool search and tools loaded through its results are supported.
+
+The gateway does not execute tools itself. The client executes returned calls and
+sends the complete history on the next request. `previous_response_id`, hosted
+tools (such as server-side web search), and image `file_id` references are not
+implemented and return an explicit error rather than silently losing context.
+Screenshots must be inline data or image URLs. A truncated tool stream is not
+reported as a successfully completed tool call.
+
 ## File Layout
 
 ```text
