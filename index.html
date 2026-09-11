@@ -232,6 +232,10 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
             <div class="field"><label>项目关键词</label><div style="display:flex;gap:8px"><input id="smsSearch" placeholder="输入项目名称，如 Telegram 或 智谱AI" style="flex:1"><button type="button" class="btn" style="white-space:nowrap" onclick="smsLoadProjects()">搜索项目</button></div></div>
             <div class="field"><label>项目</label><select id="smsProject"><option value="">先搜索项目</option></select></div>
             <div class="field"><label>通道（价格从低到高）</label><select id="smsChannel"><option value="">先选项目</option></select></div>
+            <div id="smsSmsnexFilters" style="display:none">
+              <div class="field"><label>号码类型</label><select id="smsCardFilter" onchange="smsRenderChannels()"><option value="">全部</option><option value="real">实卡</option><option value="virtual">虚卡</option></select></div>
+              <div class="field"><label>运营商</label><select id="smsIspFilter" onchange="smsRenderChannels()"><option value="">全部</option><option>移动</option><option>联通</option><option>电信</option><option>广电</option><option>虚拟运营商</option></select></div>
+            </div>
             <div id="smsEomsgOptions" style="display:none">
               <div class="field"><label>卡类型</label><select id="smsCardType"><option value="全部">全部</option><option value="实卡">实卡</option><option value="虚卡">虚卡</option></select></div>
               <div class="field"><label>归属地</label><input id="smsProvince" placeholder="留空为全部归属地"></div>
@@ -717,7 +721,7 @@ async function gwSaveConfig(){
 }
 
 // ---- SMS 接码管理 ----
-const smsState={platforms:[],projects:[],phones:[],providerRestored:false};
+const smsState={platforms:[],projects:[],channels:[],phones:[],providerRestored:false};
 let smsAccountSeq=0,smsProjectSeq=0;
 function smsProvider(){return document.getElementById('smsPlatform').value||'smsnex';}
 async function smsFetch(url,options){
@@ -726,7 +730,11 @@ async function smsFetch(url,options){
   if(!r.ok)throw new Error((j&&typeof j.error==='string')?j.error:(j&&j.error&&j.error.message)||('HTTP '+r.status));
   return j;
 }
-function smsUpdateMode(){document.getElementById('smsEomsgOptions').style.display=smsProvider()==='eomsg'?'block':'none';}
+function smsUpdateMode(){
+  const isEomsg=smsProvider()==='eomsg';
+  document.getElementById('smsEomsgOptions').style.display=isEomsg?'block':'none';
+  document.getElementById('smsSmsnexFilters').style.display=isEomsg?'none':'block';
+}
 function smsLoadPage(){
   smsLoadPlatforms().then(()=>{
     const p=smsState.platforms.find(x=>x.id===smsProvider());
@@ -770,6 +778,7 @@ async function smsLoadProjects(isDefault){
     const def=smsState.projects.find(p=>p.name===name)||smsState.projects[0];
     if(def){sel.value=String(def.id);smsLoadChannels();}
     else document.getElementById('smsChannel').innerHTML='<option value="">先选项目</option>';
+    if(!smsState.projects.length)smsState.channels=[];
   }catch(e){
     if(seq===smsProjectSeq)sel.innerHTML='<option value="">加载失败</option>';
   }
@@ -781,9 +790,20 @@ async function smsLoadChannels(){
   const project=smsState.projects.find(p=>String(p.id)===String(projectId));
   try{
     const j=await smsFetch('/api/sms/channels?provider='+encodeURIComponent(smsProvider())+'&projectId='+encodeURIComponent(projectId)+'&platform='+encodeURIComponent(project&&project.platform||'domestic'));
-    const channels=j.list||[];
-    sel.innerHTML=channels.length?channels.map(c=>'<option value="'+escapeHtml(String(c.uid))+'">'+escapeHtml(c.name||String(c.uid))+(c.price!=null?' · ¥'+Number(c.price).toFixed(2)+(c.availableNumber!=null?' · 剩'+c.availableNumber:''):'')+'</option>').join(''):'<option value="">无可用通道</option>';
-  }catch(e){sel.innerHTML='<option value="">通道加载失败</option>';}
+    smsState.channels=j.list||[];
+    smsRenderChannels();
+  }catch(e){smsState.channels=[];sel.innerHTML='<option value="">通道加载失败</option>';}
+}
+function smsChannelTags(name){
+  return String(name||'').split('|').map(t=>t.trim()).filter(Boolean);
+}
+function smsRenderChannels(){
+  const sel=document.getElementById('smsChannel'),card=document.getElementById('smsCardFilter').value,isp=document.getElementById('smsIspFilter').value;
+  let channels=smsState.channels||[];
+  if(card==='real')channels=channels.filter(c=>!smsChannelTags(c.name).includes('虚拟运营商'));
+  else if(card==='virtual')channels=channels.filter(c=>{const t=smsChannelTags(c.name);return t.length===1&&t[0]==='虚拟运营商';});
+  if(isp)channels=channels.filter(c=>smsChannelTags(c.name).includes(isp));
+  sel.innerHTML=channels.length?channels.map(c=>'<option value="'+escapeHtml(String(c.uid))+'">'+escapeHtml(c.name||String(c.uid))+(c.price!=null?' · ¥'+Number(c.price).toFixed(2)+(c.availableNumber!=null?' · 剩'+c.availableNumber:''):'')+'</option>').join(''):'<option value="">无匹配通道，请放宽筛选</option>';
 }
 async function smsRent(){
   const projectId=document.getElementById('smsProject').value,chUid=document.getElementById('smsChannel').value;
