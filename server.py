@@ -2009,13 +2009,30 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     curl = ""
                 else:
                     raise ValueError("curl is required")
+                is_new = not account_id
+                auto_account_id = extract_account_id(curl) if curl else None
+                if is_new and auto_account_id:
+                    # Re-importing a curl for a known platform account updates
+                    # that entry instead of creating a duplicate. Prefer a
+                    # visible entry; hidden leftovers only match as a fallback.
+                    hidden_fallback = None
+                    for _aid, _acc in requests.items():
+                        if not (isinstance(_acc, dict) and str(_acc.get("accountId", "") or "") == auto_account_id):
+                            continue
+                        if _acc.get("dashboardHidden") is not True:
+                            account_id = _aid
+                            existing = _acc
+                            break
+                        if hidden_fallback is None:
+                            hidden_fallback = (_aid, _acc)
+                    if not account_id and hidden_fallback:
+                        account_id, existing = hidden_fallback
                 account_id = account_id or f"acc_{uuid.uuid4().hex[:12]}"
                 definition = {"source": source, "label": label, "curl": curl, "updatedAt": payload.get("updatedAt")}
                 if curl:
                     cookie_expires = extract_cookie_expiry(curl)
                     if cookie_expires:
                         definition["cookieExpires"] = cookie_expires
-                    auto_account_id = extract_account_id(curl)
                     if auto_account_id:
                         definition["accountId"] = auto_account_id
                 if source == "googleAi":
@@ -2032,7 +2049,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         # Fields the request omits keep their stored value, so a
                         # label-only update cannot wipe sensitive account data.
                         definition[_field] = existing[_field]
-                if isinstance(existing.get("dashboardHidden"), bool) and existing["dashboardHidden"]:
+                if not is_new and isinstance(existing.get("dashboardHidden"), bool) and existing["dashboardHidden"]:
                     definition["dashboardHidden"] = True
                 if payload.get("dashboardHidden") is True:
                     definition["dashboardHidden"] = True

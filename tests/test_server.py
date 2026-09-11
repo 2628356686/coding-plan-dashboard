@@ -264,6 +264,103 @@ class VolcengineOpenApiTest(unittest.TestCase):
             self.assertEqual(result["refreshToken"], "RT_OLD")
             self.assertEqual(result["proxy"], "http://p:1")
 
+    def test_reimport_curl_reuses_account_with_same_account_id(self):
+        """POST /api/requests without id reuses the entry whose accountId matches the curl cookie."""
+        from server import DashboardHandler
+        from io import BytesIO
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            req_path = Path(tmp) / "requests.json"
+            curl = "curl 'https://console.volcengine.com/api/top/ark/cn-beijing/2024-01-01/GetAgentPlanAFPUsage' -b 'AccountID=12345; session=abc'"
+            save_requests(req_path, {"acc_old": {"source": "volcAgent", "label": "old", "curl": curl, "accountId": "12345"}})
+            DashboardHandler.requests_path = req_path
+            DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
+            DashboardHandler.results_path = Path(tmp) / "results.json"
+            DashboardHandler.order_path = Path(tmp) / "order.json"
+
+            body = _json.dumps({"curl": curl, "label": "updated", "updatedAt": "2026-07-22T00:00:00Z"}).encode()
+            handler = DashboardHandler.__new__(DashboardHandler)
+            handler.path = "/api/requests"
+            handler.headers = {"Content-Length": str(len(body))}
+            handler.rfile = BytesIO(body)
+            captured = {}
+            handler.send_json = lambda payload: captured.update({"payload": payload})
+            handler.wfile = BytesIO()
+
+            DashboardHandler.do_POST(handler)
+
+            self.assertEqual(captured["payload"]["id"], "acc_old")
+            self.assertEqual(captured["payload"]["accountId"], "12345")
+            result = load_requests(req_path)
+            self.assertEqual(list(result.keys()), ["acc_old"])
+            self.assertEqual(result["acc_old"]["label"], "updated")
+            self.assertEqual(result["acc_old"]["accountId"], "12345")
+
+    def test_reimport_prefers_visible_entry_over_hidden_duplicate(self):
+        """A fresh import reuses the visible entry when a hidden duplicate shares the accountId."""
+        from server import DashboardHandler
+        from io import BytesIO
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            req_path = Path(tmp) / "requests.json"
+            curl = "curl 'https://console.volcengine.com/api/top/ark/cn-beijing/2024-01-01/GetAgentPlanAFPUsage' -b 'AccountID=12345; session=abc'"
+            save_requests(req_path, {
+                "acc_hidden": {"source": "volcAgent", "label": "hidden", "curl": curl, "accountId": "12345", "dashboardHidden": True},
+                "acc_visible": {"source": "volcAgent", "label": "visible", "curl": curl, "accountId": "12345"},
+            })
+            DashboardHandler.requests_path = req_path
+            DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
+            DashboardHandler.results_path = Path(tmp) / "results.json"
+            DashboardHandler.order_path = Path(tmp) / "order.json"
+
+            body = _json.dumps({"curl": curl, "label": "updated", "updatedAt": "2026-07-22T00:00:00Z"}).encode()
+            handler = DashboardHandler.__new__(DashboardHandler)
+            handler.path = "/api/requests"
+            handler.headers = {"Content-Length": str(len(body))}
+            handler.rfile = BytesIO(body)
+            captured = {}
+            handler.send_json = lambda payload: captured.update({"payload": payload})
+            handler.wfile = BytesIO()
+
+            DashboardHandler.do_POST(handler)
+
+            self.assertEqual(captured["payload"]["id"], "acc_visible")
+            result = load_requests(req_path)
+            self.assertNotIn("dashboardHidden", result["acc_visible"])
+
+    def test_reimport_unhides_account_matched_from_hidden_entry(self):
+        """A fresh import that can only match a hidden entry makes it visible again."""
+        from server import DashboardHandler
+        from io import BytesIO
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            req_path = Path(tmp) / "requests.json"
+            curl = "curl 'https://console.volcengine.com/api/top/ark/cn-beijing/2024-01-01/GetAgentPlanAFPUsage' -b 'AccountID=12345; session=abc'"
+            save_requests(req_path, {"acc_hidden": {"source": "volcAgent", "label": "hidden", "curl": curl, "accountId": "12345", "dashboardHidden": True}})
+            DashboardHandler.requests_path = req_path
+            DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
+            DashboardHandler.results_path = Path(tmp) / "results.json"
+            DashboardHandler.order_path = Path(tmp) / "order.json"
+
+            body = _json.dumps({"curl": curl, "label": "updated", "updatedAt": "2026-07-22T00:00:00Z"}).encode()
+            handler = DashboardHandler.__new__(DashboardHandler)
+            handler.path = "/api/requests"
+            handler.headers = {"Content-Length": str(len(body))}
+            handler.rfile = BytesIO(body)
+            captured = {}
+            handler.send_json = lambda payload: captured.update({"payload": payload})
+            handler.wfile = BytesIO()
+
+            DashboardHandler.do_POST(handler)
+
+            self.assertEqual(captured["payload"]["id"], "acc_hidden")
+            result = load_requests(req_path)
+            self.assertEqual(list(result.keys()), ["acc_hidden"])
+            self.assertNotIn("dashboardHidden", result["acc_hidden"])
+
 
 if __name__ == "__main__":
     unittest.main()
