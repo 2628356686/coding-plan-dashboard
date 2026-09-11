@@ -167,6 +167,7 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
       <section id="page-accounts" class="page">
         <div class="page-header">
           <div><h2>账号管理</h2><p>管理所有已配置的平台账号，查看登录态有效期</p></div>
+          <button class="btn" id="openLoginBtn" title="在本机以无痕/隐私窗口打开火山引擎登录页（服务需运行在本机）" onclick="openVolcLogin()">去登录</button>
         </div>
         <div id="accountsTableContainer"></div>
       </section>
@@ -409,6 +410,16 @@ function copyText(text, btn){
   }
 }
 const gatewayTogglePending=new Set();
+async function openVolcLogin(){
+  const btn=document.getElementById('openLoginBtn');
+  btn.disabled=true;
+  try{
+    const r=await fetch('/api/open-login',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+  }catch(e){alert('打开登录页失败：'+e.message+(String(e.message).includes('browser')?'\n（服务部署在 Docker/NAS 时无法打开浏览器，请在服务所在机器上操作）':''));}
+  finally{btn.disabled=false;}
+}
 async function toggleAccountGateway(id){
   if(locked){lockedAlert();return;}
   const acc=requestDefinitions[id];
@@ -445,8 +456,9 @@ function renderAccountsTable(){
     const accountId=acc.accountId?escapeHtml(acc.accountId)+_cb(acc.accountId):dash;
     const apiKey=acc.apiKey?escapeHtml(acc.apiKey)+_cb(acc.apiKey):dash;
     const sourceName=src.name+(src.sub?' '+src.sub:'');
-    const enabled=acc.gateway?.enabled!==false;
-    const gatewaySwitch=`<button type="button" class="gateway-switch" role="switch" aria-checked="${enabled}" aria-label="网关转发" ${gatewayTogglePending.has(id)?'disabled':''} data-account-id="${escapeHtml(id)}" onclick="toggleAccountGateway(this.dataset.accountId)"><span class="gateway-switch-track" aria-hidden="true"></span><span>${enabled?'开启':'关闭'}</span></button>`;
+    const hasKey=!!(acc.apiKey&&acc.apiKey.trim());
+    const enabled=hasKey&&acc.gateway?.enabled!==false;
+    const gatewaySwitch=`<button type="button" class="gateway-switch" role="switch" aria-checked="${enabled}" aria-label="网关转发" title="${hasKey?'网关转发开关':'缺少 API Key，无法开启网关'}" ${(!hasKey||gatewayTogglePending.has(id))?'disabled':''} data-account-id="${escapeHtml(id)}" onclick="toggleAccountGateway(this.dataset.accountId)"><span class="gateway-switch-track" aria-hidden="true"></span><span>${enabled?'开启':'关闭'}</span></button>`;
     return `<tr><td><div class="platform"><div class="logo ${src.className}">${src.logo}</div><div class="name">${escapeHtml(sourceName)}</div></div></td><td>${label}</td><td>${phone}</td><td>${username}</td><td>${password}</td><td>${accountId}</td><td>${apiKey}</td><td>${cookieStr}</td><td style="color:var(--muted)">${updatedAt}</td><td>${gatewaySwitch}</td><td><button class="btn" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="editAccountFromTable('${id}')">编辑</button><button class="btn danger" style="padding:4px 10px;font-size:12px" onclick="deleteAccount('${id}')">删除</button></td></tr>`;
   }).join('');
   container.innerHTML=`<div class="accounts-table-wrap"><table class="accounts-table"><thead><tr><th>平台</th><th>备注</th><th>手机号</th><th>用户名</th><th>密码</th><th>AccountID</th><th>API Key</th><th>登录态有效期</th><th>数据更新时间</th><th>网关启用</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;

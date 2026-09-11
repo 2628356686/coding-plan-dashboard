@@ -21,8 +21,12 @@ adheres to [Semantic Versioning](https://semver.org/).
 - SMS verification (接码) management page proxying 号码盾 (smsnex) and EOMSG:
   platform config with masked keys, project/channel lookup, rent, first/second
   code polling and release, persisted in `data/sms.json`.
+- "去登录" button on the accounts page that opens the Volcengine login page in a
+  private/incognito browser window on the server host.
 
 ### Fixed
 - Dashboard quotas now auto-refresh every 60 seconds and immediately when the
   tab becomes visible again, instead of requiring a manual refresh; overlapping
   refresh requests are skipped.
+- Gateway toggle is rejected by the server and disabled in the accounts table
+  for accounts without an API key; turning it off stays allowed.

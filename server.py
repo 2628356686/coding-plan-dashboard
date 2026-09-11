@@ -5,6 +5,9 @@ import json
 import os
 import re
 import shlex
+import shutil
+import subprocess
+import sys
 import time
 import random
 import uuid
@@ -1374,6 +1377,73 @@ def eomsg_upstream(cfg, code, params=()):
     raise SmsError(502, "EOMSG 暂时不可用，请稍后重试")
 
 
+# ============================================================================
+# Private-window login helper (账号管理 → 去登录)
+# ============================================================================
+
+VOLC_LOGIN_URL = "https://signin.volcengine.com/auth/login"
+
+
+def find_private_browser():
+    """Locate a locally installed browser that supports private windows.
+
+    Returns the command prefix [executable, private-mode-flag], or None when no
+    usable browser exists on the server host (e.g. inside a container)."""
+    candidates = []
+    if sys.platform == "win32":
+        dirs = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+                os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                os.environ.get("LocalAppData", "")]
+        for base in dirs:
+            if not base:
+                continue
+            candidates += [
+                (os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"), "--incognito"),
+                (os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"), "--inprivate"),
+                (os.path.join(base, "Mozilla Firefox", "firefox.exe"), "-private-window"),
+            ]
+        for name, flag in (("chrome.exe", "--incognito"),
+                           ("msedge.exe", "--inprivate"),
+                           ("firefox.exe", "-private-window")):
+            found = shutil.which(name)
+            if found:
+                candidates.append((found, flag))
+    elif sys.platform == "darwin":
+        candidates = [
+            ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--incognito"),
+            ("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", "--inprivate"),
+            ("/Applications/Firefox.app/Contents/MacOS/firefox", "-private-window"),
+        ]
+    else:
+        for name, flag in (("google-chrome", "--incognito"),
+                           ("chromium", "--incognito"),
+                           ("chromium-browser", "--incognito"),
+                           ("microsoft-edge", "--inprivate"),
+                           ("firefox", "-private-window")):
+            found = shutil.which(name)
+            if found:
+                candidates.append((found, flag))
+    for path, flag in candidates:
+        if path and os.path.isfile(path):
+            return [path, flag]
+    return None
+
+
+def open_private_login():
+    """Launch a private/incognito window at VOLC_LOGIN_URL on the server host.
+
+    Returns the browser executable name, or None when no browser is available.
+    The URL is a server-side constant and the command is a plain argv list, so
+    no user input ever reaches the subprocess."""
+    cmd = find_private_browser()
+    if not cmd:
+        return None
+    subprocess.Popen(cmd + [VOLC_LOGIN_URL], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     close_fds=True)
+    return cmd[0]
+
+
 class DashboardHandler(SimpleHTTPRequestHandler):
     snapshot_path = Path(os.environ.get("SNAPSHOT_PATH", "/data/snapshot.json"))
     requests_path = Path(os.environ.get("REQUESTS_PATH", "/data/requests.json"))
@@ -1473,6 +1543,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/sms/"):
             self.handle_sms_request("POST")
             return
+        if self.path == "/api/open-login":
+            self.handle_open_login()
+            return
         if self.path not in {"/api/snapshot", "/api/requests", "/api/refresh", "/api/order", "/api/requests/gateway"}:
             self.send_error(404)
             return
@@ -1493,6 +1566,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     self.send_error(404, "account not found")
                     return
                 account = accounts[account_id]
+                if enabled and not str(account.get("apiKey", "")).strip():
+                    self.send_error(400, "account has no apiKey; cannot enable gateway")
+                    return
                 gateway = dict(account.get("gateway") or {})
                 gateway["enabled"] = enabled
                 account["gateway"] = gateway
@@ -2050,6 +2126,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "totalRequests": _gateway_stats.get("total_requests", 0),
             "accounts": account_status,
         })
+
+    def handle_open_login(self):
+        browser = open_private_login()
+        if browser is None:
+            self.send_error(503, "no usable browser found on the server host")
+            return
+        self.send_json({"ok": True, "browser": os.path.basename(browser)})
 
     def _sms_read_json(self):
         length = int(self.headers.get("Content-Length", "0"))

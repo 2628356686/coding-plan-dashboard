@@ -390,6 +390,27 @@ class GatewayProtocolsTest(unittest.TestCase):
                 error.exception.close()
                 save.assert_not_called()
 
+    def test_keyless_account_cannot_enable_gateway(self):
+        account = {'source': 'volcAgent', 'label': 'NoKey', 'apiKey': '   '}
+        accounts = {'a': account}
+        with patch.object(server, 'load_requests', return_value=accounts), \
+             patch.object(server, 'save_requests') as save:
+            def toggle(enabled):
+                req = Request(self.gateway + '/api/requests/gateway',
+                              data=json.dumps({'id': 'a', 'enabled': enabled}).encode(),
+                              headers={'Content-Type': 'application/json'})
+                return urlopen(req, timeout=3)
+            with self.assertRaises(HTTPError) as error:
+                toggle(True)
+            self.assertEqual(error.exception.code, 400)
+            error.exception.close()
+            self.assertIsNone(account.get('gateway'))
+            save.assert_not_called()
+            with toggle(False) as response:
+                result = json.load(response)
+            self.assertEqual(result['gateway'], {'enabled': False})
+            self.assertEqual(save.call_count, 1)
+
 
 class PortSettingTest(unittest.TestCase):
     def test_normalize_gateway_port(self):
@@ -654,6 +675,48 @@ class RoutingTest(unittest.TestCase):
             with patch.object(server, 'execute_curl', return_value=(200, '{"Result":{"QuotaUsage":[{"Percent":"10%"}]}}', '')):
                 server.refresh_gateway_quotas(accounts)
             self.assertEqual(server.account_remaining_percent('a', server.gateway_routing_snapshot({})), 90)
+
+
+class OpenLoginTest(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+
+        class Quiet(server.DashboardHandler):
+            def log_message(self, *args):
+                pass
+
+        httpd = ThreadingHTTPServer(('127.0.0.1', 0), Quiet)
+        self.base = 'http://127.0.0.1:%d' % httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.stack.callback(httpd.server_close)
+        self.stack.callback(thread.join, 2)
+        self.stack.callback(httpd.shutdown)
+
+    def test_open_login_launches_browser_with_fixed_url(self):
+        with patch.object(server, 'find_private_browser', return_value=['chrome', '--incognito']), \
+             patch.object(server.subprocess, 'Popen') as popen:
+            with urlopen(Request(self.base + '/api/open-login', method='POST'), timeout=3) as response:
+                result = json.load(response)
+            self.assertTrue(result['ok'])
+            self.assertEqual(result['browser'], 'chrome')
+            popen.assert_called_once()
+            self.assertEqual(popen.call_args[0][0],
+                             ['chrome', '--incognito', server.VOLC_LOGIN_URL])
+
+    def test_open_login_without_browser_returns_503(self):
+        with patch.object(server, 'find_private_browser', return_value=None):
+            with self.assertRaises(HTTPError) as error:
+                urlopen(Request(self.base + '/api/open-login', method='POST'), timeout=3)
+            self.assertEqual(error.exception.code, 503)
+            error.exception.close()
+
+    def test_find_private_browser_returns_flag_pair_when_available(self):
+        found = server.find_private_browser()
+        if found is not None:
+            self.assertEqual(len(found), 2)
+            self.assertIn(found[1], ('--incognito', '--inprivate', '-private-window'))
 
 
 if __name__ == '__main__':
