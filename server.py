@@ -6,6 +6,8 @@ import logging
 import os
 import re
 import shlex
+import select
+import socket
 import shutil
 import subprocess
 import sys
@@ -564,6 +566,94 @@ _gateway_quota_cache = {}
 
 class GatewayRetry(Exception):
     """Upstream failed before any downstream headers were sent."""
+
+
+GATEWAY_STREAM_IDLE_TIMEOUT = 120
+GATEWAY_STREAM_POLL_INTERVAL = 0.25
+
+
+class GatewayStreamGuard:
+    """Interrupt blocked upstream reads/writes when a streaming client leaves."""
+
+    def __init__(self, response, client):
+        self.response = response
+        self.client = client
+        self.last_read = time.monotonic()
+        self.reason = None
+        self.stop = Event()
+        # urllib HTTP and HTTPS responses expose their transport here. Keep the
+        # socket reference before EOF clears response.fp; close in the owner.
+        self.upstream = response.fp.raw._sock
+        self.worker = Thread(target=self.watch, name="gateway-stream-watch", daemon=True)
+
+    def __enter__(self):
+        self.worker.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        self.worker.join()
+
+    def watch(self):
+        while not self.stop.wait(GATEWAY_STREAM_POLL_INTERVAL):
+            try:
+                readable, _, _ = select.select([self.client], [], [], 0)
+                if readable and not self.client.recv(1, socket.MSG_PEEK):
+                    self.reason = "client disconnected"
+            except (OSError, ValueError):
+                self.reason = "client disconnected"
+            if self.reason is None and time.monotonic() - self.last_read >= GATEWAY_STREAM_IDLE_TIMEOUT:
+                self.reason = "upstream stream idle timeout"
+            if self.reason:
+                log.info("gw stream stopped: %s", self.reason)
+                # shutdown unblocks a read in another thread. response.close()
+                # alone can wait for that reader's buffered-I/O lock forever.
+                for transport in (self.upstream, self.client):
+                    try:
+                        transport.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                return
+
+    def __iter__(self):
+        pending = b""
+        while True:
+            if self.reason:
+                raise OSError(self.reason)
+            chunk = self.response.read1(4096)
+            if self.reason:
+                raise OSError(self.reason)
+            if not chunk:
+                if pending:
+                    yield pending
+                return
+            self.last_read = time.monotonic()
+            lines = (pending + chunk).split(b"\n")
+            pending = lines.pop()
+            for line in lines:
+                yield line + b"\n"
+
+
+def gateway_native_stream(stream, protocol):
+    """Forward SSE verbatim and finish without waiting for upstream TCP EOF."""
+    data = []
+    for raw_line in stream:
+        yield raw_line
+        line = raw_line.rstrip(b"\r\n")
+        if line.startswith(b"data:"):
+            data.append(line[5:].lstrip(b" "))
+        elif not line:
+            value = b"\n".join(data)
+            data = []
+            if protocol == "openai" and value == b"[DONE]":
+                return
+            if protocol == "anthropic" and value:
+                try:
+                    message = json.loads(value)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if isinstance(message, dict) and message.get("type") == "message_stop":
+                    return
 
 
 def normalize_gateway_quota(payload):
@@ -1158,15 +1248,28 @@ def response_tool_item(call, context=None):
     return item
 
 
-def openai_to_responses(body, model, tool_context=None):
+def upstream_reasoning_text(message):
+    """Only accept public text returned by the upstream, never opaque state."""
+    text = message.get("reasoning_content") or message.get("reasoning") or ""
+    if not isinstance(text, str):
+        raise ValueError("upstream reasoning must be text")
+    return text
+
+
+def openai_to_responses(body, model, tool_context=None, include_reasoning=False):
     choice = (body.get("choices") or [{}])[0]
     message = choice.get("message", {})
     content = message.get("content", "") or ""
     output = []
+    incomplete = choice.get("finish_reason") in ("length", "content_filter")
+    reasoning = upstream_reasoning_text(message) if include_reasoning else ""
+    if reasoning:
+        output.append({"id": "rs_" + uuid.uuid4().hex, "type": "reasoning",
+                       "status": "incomplete" if incomplete else "completed",
+                       "summary": [{"type": "summary_text", "text": reasoning}]})
     if content:
         output.append({"id": "msg_" + uuid.uuid4().hex, "type": "message", "status": "completed",
                        "role": "assistant", "content": [{"type": "output_text", "text": content, "annotations": []}]})
-    incomplete = choice.get("finish_reason") in ("length", "content_filter")
     if not incomplete:
         output.extend(response_tool_item(call, tool_context) for call in message.get("tool_calls") or [])
     return {
@@ -1202,7 +1305,7 @@ def iter_sse_data(stream):
         yield "\n".join(data)
 
 
-def gateway_responses_stream(stream, protocol, model, tool_context=None):
+def gateway_responses_stream(stream, protocol, model, tool_context=None, include_reasoning=False):
     """Translate text and indexed tool argument deltas into Responses events."""
     response = {
         "id": "resp_" + uuid.uuid4().hex, "object": "response",
@@ -1227,6 +1330,39 @@ def gateway_responses_stream(stream, protocol, model, tool_context=None):
     usage = {}
     calls = {}
     text_index = None
+    reasoning_item = None
+    reasoning_index = None
+
+    def reasoning_events(delta):
+        nonlocal reasoning_item, reasoning_index
+        if not delta:
+            return
+        if not isinstance(delta, str):
+            raise ValueError("upstream reasoning must be text")
+        if reasoning_item is None:
+            reasoning_index = len(response["output"])
+            reasoning_item = {"id": "rs_" + uuid.uuid4().hex, "type": "reasoning",
+                              "status": "in_progress", "summary": []}
+            response["output"].append(reasoning_item)
+            yield emit("response.output_item.added", output_index=reasoning_index, item=reasoning_item)
+            reasoning_item["summary"].append({"type": "summary_text", "text": ""})
+            yield emit("response.reasoning_summary_part.added", item_id=reasoning_item["id"],
+                       output_index=reasoning_index, summary_index=0, part=reasoning_item["summary"][0])
+        reasoning_item["summary"][0]["text"] += delta
+        yield emit("response.reasoning_summary_text.delta", item_id=reasoning_item["id"],
+                   output_index=reasoning_index, summary_index=0, delta=delta)
+
+    def finish_reasoning(status="completed"):
+        nonlocal reasoning_item
+        if reasoning_item is None:
+            return
+        fields = dict(item_id=reasoning_item["id"], output_index=reasoning_index, summary_index=0)
+        summary = reasoning_item["summary"][0]
+        yield emit("response.reasoning_summary_text.done", **fields, text=summary["text"])
+        yield emit("response.reasoning_summary_part.done", **fields, part=summary)
+        reasoning_item["status"] = status
+        yield emit("response.output_item.done", output_index=reasoning_index, item=reasoning_item)
+        reasoning_item = None
 
     def tool_events(index, call_delta):
         state = calls.setdefault(index, {"id": "", "name": "", "arguments": "", "item": None})
@@ -1277,6 +1413,7 @@ def gateway_responses_stream(stream, protocol, model, tool_context=None):
             if not isinstance(chunk, dict) or chunk.get("error") or chunk.get("type") == "error":
                 raise ValueError("upstream stream error")
             text_delta = ""
+            reasoning_delta = ""
             tool_deltas = []
             if protocol == "openai":
                 if chunk.get("usage"):
@@ -1286,6 +1423,8 @@ def gateway_responses_stream(stream, protocol, model, tool_context=None):
                         continue
                     delta = choice.get("delta") or {}
                     text_delta += delta.get("content") or ""
+                    if include_reasoning:
+                        reasoning_delta += upstream_reasoning_text(delta)
                     tool_deltas.extend((c.get("index", i), c) for i, c in enumerate(delta.get("tool_calls") or []))
                     if delta.get("refusal"):
                         raise ValueError("unsupported upstream output")
@@ -1302,10 +1441,14 @@ def gateway_responses_stream(stream, protocol, model, tool_context=None):
                             "name": block["name"], "arguments": json.dumps(initial, ensure_ascii=False) if initial else ""}}))
                     if block.get("type") == "text":
                         text_delta = block.get("text", "")
+                    elif include_reasoning and block.get("type") == "thinking":
+                        reasoning_delta = block.get("thinking", "")
                 elif kind == "content_block_delta":
                     delta = chunk.get("delta") or {}
                     if delta.get("type") == "text_delta":
                         text_delta = delta.get("text", "")
+                    elif include_reasoning and delta.get("type") == "thinking_delta":
+                        reasoning_delta = delta.get("thinking", "")
                     elif delta.get("type") == "input_json_delta":
                         tool_deltas.append((chunk["index"], {"function": {"arguments": delta.get("partial_json", "")}}))
                 elif kind == "message_delta":
@@ -1314,6 +1457,9 @@ def gateway_responses_stream(stream, protocol, model, tool_context=None):
                 elif kind == "message_stop":
                     terminal = True
                     break
+            yield from reasoning_events(reasoning_delta)
+            if text_delta or tool_deltas:
+                yield from finish_reasoning()
             if text_delta:
                 if item is None:
                     item = {"id": "msg_" + uuid.uuid4().hex, "type": "message",
@@ -1331,6 +1477,7 @@ def gateway_responses_stream(stream, protocol, model, tool_context=None):
                 yield from tool_events(index, call_delta)
         if not terminal:
             raise ValueError("upstream stream ended before its terminal event")
+        yield from finish_reasoning("incomplete" if finish_reason in ("length", "max_tokens", "content_filter") else "completed")
         if calls and finish_reason in ("length", "max_tokens", "content_filter"):
             # Do not emit completed executable calls when arguments are truncated.
             response["status"] = "incomplete"
@@ -1523,7 +1670,7 @@ def openai_to_anthropic_request(body):
     return result
 
 
-def anthropic_response_to_openai(body, model):
+def anthropic_response_to_openai(body, model, include_reasoning=False):
     """Anthropic messages response -> OpenAI chat/completions response."""
     content = body.get("content", [])
     if isinstance(content, list):
@@ -1540,6 +1687,11 @@ def anthropic_response_to_openai(body, model):
     elif stop_reason == "tool_use":
         finish = "tool_calls"
     message = {"role": "assistant", "content": text}
+    if include_reasoning and isinstance(content, list):
+        message["reasoning_content"] = "".join(
+            c.get("thinking", "") for c in content
+            if isinstance(c, dict) and c.get("type") == "thinking"
+        )
     if isinstance(content, list):
         calls = [{"id": c["id"], "type": "function", "function": {
             "name": c["name"], "arguments": json.dumps(c.get("input", {}), ensure_ascii=False)}}
@@ -1641,6 +1793,104 @@ def load_sms_config():
 
 def save_sms_config(config):
     save_snapshot(str(SMS_CONFIG_PATH), config)
+
+
+CONFIG_BACKUP_FORMAT = "coding-plan-dashboard-config"
+CONFIG_BACKUP_MAX_BYTES = 16 * 1024 * 1024
+CONFIG_TRANSFER_LOCK = RLock()
+
+
+def validate_config_backup(payload):
+    """Validate portable settings without authenticating or contacting providers."""
+    if (not isinstance(payload, dict) or payload.get("format") != CONFIG_BACKUP_FORMAT
+            or type(payload.get("version")) is not int or payload["version"] != 1):
+        raise ValueError("请选择本应用导出的 v1 配置 JSON 文件")
+    accounts, sms, order = (payload.get(key) for key in ("accounts", "sms", "order"))
+    if not isinstance(accounts, dict) or not isinstance(sms, dict) or not isinstance(order, list):
+        raise ValueError("配置必须包含 accounts、sms 和 order")
+    text_fields = {"source", "curl", "label", "ak", "sk", "refreshToken", "proxy",
+                   "phone", "username", "password", "accountId", "apiKey"}
+    for aid, acc in accounts.items():
+        if not re.fullmatch(r"acc_[A-Za-z0-9_-]+", aid) or not isinstance(acc, dict):
+            raise ValueError("账号 ID 或账号配置格式无效")
+        if any(key not in text_fields | {"updatedAt", "cookieExpires", "dashboardHidden", "gateway"}
+               for key in acc):
+            raise ValueError("账号配置包含不支持的字段")
+        if any(not isinstance(value, str) for key, value in acc.items() if key in text_fields):
+            raise ValueError("账号文本字段格式无效")
+        if acc.get("updatedAt") is not None and not isinstance(acc["updatedAt"], str):
+            raise ValueError("账号更新时间格式无效")
+        if "cookieExpires" in acc and (type(acc["cookieExpires"]) not in (int, float)
+                                        or not math.isfinite(acc["cookieExpires"])):
+            raise ValueError("Cookie 到期时间格式无效")
+        if "dashboardHidden" in acc and type(acc["dashboardHidden"]) is not bool:
+            raise ValueError("账号显示设置格式无效")
+        curl = acc.get("curl", "")
+        if curl:
+            try:
+                source = infer_source(curl)
+            except ValueError:
+                raise ValueError("账号 curl 无效，或请求不在当前环境的平台白名单内") from None
+            if source != acc.get("source"):
+                raise ValueError("账号平台与 curl 不匹配")
+        elif acc.get("source") not in CREDENTIAL_SOURCES:
+            raise ValueError("账号缺少有效 curl")
+        elif not acc.get("refreshToken"):
+            raise ValueError("Google AI 账号缺少 refreshToken")
+        if "gateway" in acc:
+            gw = acc["gateway"]
+            if not isinstance(gw, dict) or set(gw) - {"enabled", "maxConcurrency"}:
+                raise ValueError("账号网关配置格式无效")
+            if "enabled" in gw and type(gw["enabled"]) is not bool:
+                raise ValueError("账号网关开关格式无效")
+            if "maxConcurrency" in gw and (type(gw["maxConcurrency"]) is not int
+                                             or not 1 <= gw["maxConcurrency"] <= 10):
+                raise ValueError("每个账号的并发上限必须是 1–10 的整数")
+    if any(not isinstance(aid, str) or aid not in accounts for aid in order) or len(set(order)) != len(order):
+        raise ValueError("账号排序包含无效或重复 ID")
+    for provider, cfg in sms.items():
+        if provider not in ("smsnex", "eomsg") or not isinstance(cfg, dict):
+            raise ValueError("接码平台配置格式无效")
+        if set(cfg) != {"enabled", "origin", "apiKey", "pollIntervalMs", "maxWaitMs"}:
+            raise ValueError("接码平台配置字段不完整或不受支持")
+        if type(cfg["enabled"]) is not bool or not isinstance(cfg["apiKey"], str):
+            raise ValueError("接码平台开关或 Key 格式无效")
+        if not isinstance(cfg["origin"], str):
+            raise ValueError("接码平台地址格式无效")
+        parsed = urlparse(cfg["origin"])
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("接码平台地址必须是有效的 HTTP 或 HTTPS 地址")
+        if cfg["enabled"] and not cfg["apiKey"].strip():
+            raise ValueError("启用的接码平台缺少 API Key")
+        if any(type(cfg[key]) is not int or cfg[key] <= 0 for key in ("pollIntervalMs", "maxWaitMs")):
+            raise ValueError("接码平台等待时间必须是正整数")
+    return accounts, sms, order
+
+
+def save_config_bundle(updates):
+    """Stage every file before replacing; restore prior bytes on a write failure."""
+    staged, previous, replaced = {}, {}, []
+    try:
+        for path, value in updates.items():
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            previous[path] = path.read_bytes() if path.exists() else None
+            temporary = path.with_name(path.name + ".import-" + uuid.uuid4().hex + ".tmp")
+            staged[path] = temporary
+            temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        for path, temporary in staged.items():
+            os.replace(temporary, path)
+            replaced.append(path)
+    except OSError:
+        for path in reversed(replaced):
+            if previous[path] is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(previous[path])
+        raise
+    finally:
+        for temporary in staged.values():
+            temporary.unlink(missing_ok=True)
 
 
 def sms_normalize(value):
@@ -1864,6 +2114,22 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/api/config/export":
+            with CONFIG_TRANSFER_LOCK:
+                accounts = load_requests(self.requests_path)
+                order = list(dict.fromkeys(aid for aid in load_order(self.order_path) if aid in accounts))
+                order.extend(aid for aid in accounts if aid not in order)
+                payload = {"format": CONFIG_BACKUP_FORMAT, "version": 1, "exportedAt": now_iso(),
+                           "accounts": accounts, "order": order, "sms": load_sms_config()}
+            body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="coding-plan-config.json"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/api/snapshot":
             self.send_json(load_snapshot(self.snapshot_path))
             return
@@ -1919,6 +2185,35 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self):
+        if self.path == "/api/config/import":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= CONFIG_BACKUP_MAX_BYTES:
+                    raise ValueError("配置文件不能为空且不能超过 16 MB")
+                payload = json.loads(self.rfile.read(length).decode("utf-8-sig"))
+                incoming, sms, order = validate_config_backup(payload)
+                with CONFIG_TRANSFER_LOCK:
+                    accounts = load_requests(self.requests_path)
+                    added = len(incoming.keys() - accounts.keys())
+                    accounts.update(incoming)
+                    merged_order = list(dict.fromkeys(order + list(incoming)
+                                                      + load_order(self.order_path) + list(accounts)))
+                    merged_sms = load_sms_config()
+                    merged_sms.update(sms)
+                    updates = {self.requests_path: accounts, SMS_CONFIG_PATH: merged_sms,
+                               self.order_path: {"order": [aid for aid in merged_order if aid in accounts]}}
+                    for path in (self.results_path, self.snapshot_path):
+                        cached = load_results(path)
+                        updates[path] = {aid: value for aid, value in cached.items() if aid not in incoming}
+                    save_config_bundle(updates)
+                self.send_json({"ok": True, "added": added, "updated": len(incoming) - added,
+                                "smsPlatforms": len(sms)})
+            except (ValueError, UnicodeDecodeError):
+                # JSON parser messages and curl text can contain imported secrets.
+                self.send_error(400, "配置文件无效：请检查版本、字段格式及当前环境的平台白名单")
+            except OSError:
+                self.send_error(500, "配置保存失败，请检查数据目录是否可写后重试")
+            return
         if self.path == "/v1/chat/completions":
             self.handle_gateway_chat("openai")
             return
@@ -2012,12 +2307,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 is_new = not account_id
                 auto_account_id = extract_account_id(curl) if curl else None
                 if is_new and auto_account_id:
-                    # Re-importing a curl for a known platform account updates
-                    # that entry instead of creating a duplicate. Prefer a
-                    # visible entry; hidden leftovers only match as a fallback.
+                    # A provider AccountID can be shared by plans on the same
+                    # platform (for example Volcengine Agent and Coding).
+                    # Match both AccountID and source so each plan stays unique.
+                    # Prefer a visible entry; hidden leftovers match only as a
+                    # fallback.
                     hidden_fallback = None
                     for _aid, _acc in requests.items():
-                        if not (isinstance(_acc, dict) and str(_acc.get("accountId", "") or "") == auto_account_id):
+                        if not (isinstance(_acc, dict)
+                                and str(_acc.get("accountId", "") or "") == auto_account_id
+                                and _acc.get("source", "") == source):
                             continue
                         if _acc.get("dashboardHidden") is not True:
                             account_id = _aid
@@ -2170,7 +2469,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _gateway_stream_openai(self, base_url, path, api_key, body_bytes, protocol="openai", output_protocol=None, model="", tool_context=None):
+    def _gateway_stream_openai(self, base_url, path, api_key, body_bytes, protocol="openai", output_protocol=None, model="", tool_context=None, include_reasoning=False):
         """Make upstream request and stream SSE response back to client in real-time."""
         url = base_url.rstrip("/") + path
         headers = {
@@ -2183,7 +2482,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             headers.update({"x-api-key": api_key, "anthropic-version": "2023-06-01"})
         req = Request(url, data=body_bytes, headers=headers, method="POST")
         try:
-            resp = urlopen(req, timeout=120)
+            resp = urlopen(req, timeout=GATEWAY_STREAM_IDLE_TIMEOUT)
         except HTTPError as e:
             try:
                 body = e.read()
@@ -2206,30 +2505,24 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             resp.close()
             self._gateway_write_json(502, {"error": {"message": "upstream did not return an event stream"}})
             return True
-        # Send SSE headers immediately
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
-
-        # Stream chunks from upstream to client
         try:
-            if output_protocol == "responses":
-                for event in gateway_responses_stream(resp, protocol, model, tool_context):
+            with GatewayStreamGuard(resp, self.connection) as stream:
+                # Once headers are sent, failures must close this response,
+                # never retry generation or send a second HTTP response.
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                events = (gateway_responses_stream(stream, protocol, model, tool_context, include_reasoning)
+                          if output_protocol == "responses" else gateway_native_stream(stream, protocol))
+                for event in events:
                     self.wfile.write(event)
                     self.wfile.flush()
-                return True
-            while True:
-                chunk = resp.read1(4096)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except (OSError, ConnectionError):
-            pass
+        except (OSError, HTTPException):
+            log.info("gw stream transport closed")
         finally:
             resp.close()
         return True
@@ -2243,16 +2536,29 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not self._gateway_authenticate(config):
             self.send_error(401, "invalid gateway api key")
             return
+        platform = detect_gateway_agent_platform(self.headers)
+        codex_responses = inbound_format == "responses" and "codex" in platform.lower()
         try:
             body, _raw = self._gateway_read_body()
             if not isinstance(body, dict):
                 raise ValueError("request body must be a JSON object")
             tool_context = {} if inbound_format == "responses" else None
             responses_body = responses_to_openai(body, tool_context) if inbound_format == "responses" else None
+            reasoning = body.get("reasoning") if codex_responses else None
+            if reasoning is None:
+                reasoning = {}
+            if not isinstance(reasoning, dict):
+                raise ValueError("reasoning must be an object")
+            summary = reasoning.get("summary")
+            if summary is not None and summary not in ("auto", "concise", "detailed", "none"):
+                raise ValueError("unsupported reasoning.summary")
+            effort = reasoning.get("effort")
+            if effort is not None and (not isinstance(effort, str) or not effort.strip()):
+                raise ValueError("reasoning.effort must be a non-empty string")
+            include_reasoning = codex_responses and summary != "none"
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             self._gateway_write_json(400, {"error": {"type": "invalid_request_error", "message": str(exc)}})
             return
-        platform = detect_gateway_agent_platform(self.headers)
 
         accounts = load_requests(self.requests_path)
         snapshot = load_snapshot(self.snapshot_path)
@@ -2310,6 +2616,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     upstream_body = dict(body)
                 if not upstream_body.get("model") and model:
                     upstream_body["model"] = model
+                if codex_responses and upstream_protocol == "openai" and effort is not None:
+                    # Chat uses a flat effort field. Preserve the requested value;
+                    # supported levels depend on the configured upstream model.
+                    upstream_body["reasoning_effort"] = effort
                 if platform and "codex" in platform.lower() \
                         and upstream_protocol == "openai" and category in {"agentPlan", "codingPlan"}:
                     upstream_body = normalize_volcengine_image_detail(upstream_body)
@@ -2335,7 +2645,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         record_gateway_request(aid, platform)
                         try:
                             self._gateway_stream_openai(base_url, upstream_path, upstream_key, upstream_bytes,
-                                                        upstream_protocol, inbound_format, model, tool_context)
+                                                        upstream_protocol, inbound_format, model, tool_context, include_reasoning)
                         except GatewayRetry as error:
                             self._gateway_retry_account(aid, attempt, max_retries, str(error))
                             last_error = str(error)
@@ -2395,7 +2705,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
                     elif upstream_protocol == "openai" and inbound_format == "responses":
                         try:
-                            out = openai_to_responses(upstream_json, out_model, tool_context) if isinstance(upstream_json, dict) else None
+                            out = openai_to_responses(upstream_json, out_model, tool_context, include_reasoning) if isinstance(upstream_json, dict) else None
                         except (ValueError, TypeError, KeyError):
                             self._gateway_write_json(502, {"error": {"message": "invalid upstream tool call"}})
                             return
@@ -2405,9 +2715,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
                     elif upstream_protocol == "anthropic" and inbound_format == "responses":
                         if isinstance(upstream_json, dict):
-                            oa = anthropic_response_to_openai(upstream_json, out_model)
                             try:
-                                out = openai_to_responses(oa, out_model, tool_context)
+                                oa = anthropic_response_to_openai(upstream_json, out_model, include_reasoning)
+                                out = openai_to_responses(oa, out_model, tool_context, include_reasoning)
                             except (ValueError, TypeError, KeyError):
                                 self._gateway_write_json(502, {"error": {"message": "invalid upstream tool call"}})
                                 return

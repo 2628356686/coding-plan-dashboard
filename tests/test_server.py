@@ -295,7 +295,43 @@ class VolcengineOpenApiTest(unittest.TestCase):
             result = load_requests(req_path)
             self.assertEqual(list(result.keys()), ["acc_old"])
             self.assertEqual(result["acc_old"]["label"], "updated")
-            self.assertEqual(result["acc_old"]["accountId"], "12345")
+
+    def test_reimport_same_account_id_different_source_creates_new_entry(self):
+        """Agent and Coding plans sharing AccountID remain separate accounts."""
+        from server import DashboardHandler
+        from io import BytesIO
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            req_path = Path(tmp) / "requests.json"
+            agent_curl = "curl 'https://console.volcengine.com/api/top/ark/cn-beijing/2024-01-01/GetAgentPlanAFPUsage' -b 'AccountID=12345; session=abc'"
+            coding_curl = "curl 'https://console.volcengine.com/api/top/ark/cn-beijing/2024-01-01/GetCodingPlanUsage' -b 'AccountID=12345; session=abc'"
+            save_requests(req_path, {"acc_agent": {"source": "volcAgent", "label": "agent", "curl": agent_curl, "accountId": "12345"}})
+            DashboardHandler.requests_path = req_path
+            DashboardHandler.snapshot_path = Path(tmp) / "snapshot.json"
+            DashboardHandler.results_path = Path(tmp) / "results.json"
+            DashboardHandler.order_path = Path(tmp) / "order.json"
+
+            body = _json.dumps({"curl": coding_curl, "label": "coding", "updatedAt": "2026-07-22T00:00:00Z"}).encode()
+            handler = DashboardHandler.__new__(DashboardHandler)
+            handler.path = "/api/requests"
+            handler.headers = {"Content-Length": str(len(body))}
+            handler.rfile = BytesIO(body)
+            captured = {}
+            handler.send_json = lambda payload: captured.update({"payload": payload})
+            handler.wfile = BytesIO()
+
+            DashboardHandler.do_POST(handler)
+
+            self.assertNotEqual(captured["payload"]["id"], "acc_agent")
+            self.assertEqual(captured["payload"]["source"], "volcCoding")
+            self.assertEqual(captured["payload"]["accountId"], "12345")
+            result = load_requests(req_path)
+            self.assertEqual(result["acc_agent"]["source"], "volcAgent")
+            self.assertEqual(result["acc_agent"]["label"], "agent")
+            coding_id = next(aid for aid, acc in result.items() if acc["source"] == "volcCoding")
+            self.assertEqual(result[coding_id]["accountId"], "12345")
+            self.assertEqual(result[coding_id]["label"], "coding")
 
     def test_reimport_prefers_visible_entry_over_hidden_duplicate(self):
         """A fresh import reuses the visible entry when a hidden duplicate shares the accountId."""

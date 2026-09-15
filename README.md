@@ -41,7 +41,22 @@ AgentPlan、Kimi Code、LongCat、千问 AI 和 Google AI (Gemini 3.5 Flash)。�
 - Self-contained single-file browser UI (`index.html`) with a custom SVG logo and no
   external favicon dependency.
 
+## Configuration transfer / 配置迁移
+
+顶部悬浮栏的「导入 | 导出」可迁移账号资料、仪表盘原始 curl（含 Cookie）、
+Google AI 凭据、账号排序和接码平台配置（含完整 Key）。导出为带版本号的 JSON；
+文件含明文凭据，请妥善保存。导入会新增账号、覆盖同 ID 账号，并覆盖文件包含的
+接码平台配置，保留目标环境的其他账号。导入后清理这些账号的旧配额缓存并刷新页面。
+导入、导出无需解锁或鉴权；服务端仍校验文件格式和现有请求平台白名单。
+迁移到新环境时，NewAPI 域名需已包含在目标环境的 `NEWAPI_HOSTS` 中。
+支持最大 16 MB 的配置文件；不包含配额历史、接码记录或全局网关设置。
+
 ## Responses gateway compatibility
+
+Streaming connections are released when the client disconnects, the upstream
+sends its terminal event, or no upstream bytes arrive for 120 seconds. Heartbeats
+count as activity. Once SSE headers are sent, the gateway closes failed streams
+without retrying model generation.
 
 The `/responses` and `/v1/responses` routes translate to the configured Chat or
 Anthropic upstream. They support function definitions, named tool choice,
@@ -50,6 +65,17 @@ and incremental SSE responses. Namespaced tools are mapped to stable upstream
 names and restored on return. Custom text tools use a JSON `input` string wrapper;
 their grammar is supplied as instructions, not enforced by the Chat API.
 Client-executed tool search and tools loaded through its results are supported.
+
+For clients identified as Codex by `Originator` or the fallback `User-Agent`,
+Responses streaming and JSON replies include upstream `reasoning_content` /
+`reasoning` text or Anthropic `thinking` text as separate Responses reasoning
+summary items. Streaming summaries arrive incrementally, before the answer or
+tool call. Explicit `reasoning.summary: "none"` disables this display; missing
+upstream reasoning produces no synthetic summary. Signatures, redacted thinking,
+and encrypted state are never presented as summary text or replayed as reasoning.
+Codex `reasoning.effort` is forwarded as `reasoning_effort` on Chat upstreams;
+accepted effort levels depend on the upstream model. Anthropic upstreams retain
+their default thinking configuration. Other clients retain their existing behavior.
 
 The gateway does not execute tools itself. The client executes returned calls and
 sends the complete history on the next request. `previous_response_id`, hosted
@@ -168,6 +194,10 @@ auto-classifies by URL:
 - `longcat.chat/api/pay/quota/metering/token-packs/summary` → LongCat
 - `cs-data.qianwenai.com/.../data/api.json` (contains `tokenplan`) → Qianwen AI TokenPlan
 - `fetchAvailableModels` (Gemini 3.5 Flash) → Google AI (Antigravity)
+
+Saving a new curl reuses an account only when both the extracted `AccountID` and
+the detected source match. AgentPlan and CodingPlan remain separate even when
+they share an `AccountID`; saving the same plan again updates its existing entry.
 
 Codex official and NewAPI endpoints can coexist; the server merges them into one
 card. `curl -sS`, `--proxy` and `--insecure` flags are translated into Python HTTPS

@@ -63,6 +63,10 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
 .app-header p{margin:5px 0 0;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .app-header .actions{flex-shrink:0;flex-wrap:nowrap;margin:0;gap:8px}
 .app-header .btn{white-space:nowrap}
+.config-transfer{display:flex;align-items:center;border:1px solid var(--line);border-radius:10px;background:#182544;flex-shrink:0}
+.config-transfer .btn{border:0;background:transparent;padding:10px}
+.config-transfer span{color:var(--muted)}
+.app-header .actions{overflow-x:auto;max-width:100%}
 .app-header .compact-label{display:none}
 .main-content>.shell{padding-top:24px}
 @media(max-width:1000px){:root{--app-header-height:112px}.app-header-inner{flex-direction:column;align-items:stretch;justify-content:center;gap:10px}.app-header .actions{justify-content:flex-start}.app-header p{display:none}.app-header h1{font-size:20px}}
@@ -122,6 +126,10 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
       <div class="app-header-inner">
         <div class="app-header-title"><h1>Coding Plan 配额中心</h1><p>统一查看各平台 Coding Plan 的限额、使用量和重置信息</p></div>
         <div class="actions">
+          <div class="config-transfer" role="group" aria-label="配置导入导出">
+            <button class="btn" id="importConfig" title="导入账号、Cookie 和接码配置，无需解锁">导入</button><span aria-hidden="true">|</span><button class="btn" id="exportConfig" title="导出账号、Cookie 和接码配置（含完整密钥），无需解锁">导出</button>
+          </div>
+          <input class="hidden" id="configFile" type="file" accept=".json,application/json" aria-label="选择配置 JSON 文件">
           <button class="btn" id="lockToggle" title="锁定/解锁编辑" aria-label="锁定/解锁编辑" style="font-size:18px;padding:8px 12px">🔒</button>
           <button class="btn primary" id="refreshAll" title="刷新可用数据"><span class="full-label">刷新可用数据</span><span class="compact-label">刷新</span></button>
           <button class="btn ghost" id="clearData" title="清除本地数据"><span class="full-label">清除本地数据</span><span class="compact-label">清除</span></button>
@@ -131,6 +139,16 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
     <main class="shell">
       <section id="page-dashboard" class="page active">
   <section class="summary" id="summary"></section>
+  <section class="panel" style="margin-bottom:18px">
+    <h3>当前并发 <span class="badge" id="gwActiveCount">—</span></h3>
+    <p class="hint" id="gwActiveHint" aria-live="polite">每秒自动更新，显示正在处理请求的账号和模型</p>
+    <div class="accounts-table-wrap">
+      <table class="accounts-table">
+        <thead><tr><th>账号</th><th>使用平台</th><th>模型</th><th>接口协议</th><th>输出方式</th><th>已持续</th></tr></thead>
+        <tbody id="gwActiveTbody"><tr><td colspan="6" style="text-align:center;color:var(--muted)">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
   <section class="refresh-alert hidden" id="refreshAlert" role="alert"></section>
   <section class="grid" id="cards"></section>
   <section class="panel">
@@ -177,16 +195,6 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
         <div class="page-header">
           <div><h2>网关管理</h2><p>配置 API 网关，按账号剩余额度加权路由，对外统一提供 OpenAI / Anthropic / Responses 兼容接口</p></div>
           <button class="btn primary" id="gwSaveBtn" onclick="gwSaveConfig()">保存网关配置</button>
-        </div>
-        <div class="panel" style="margin-bottom:18px">
-          <h3>当前并发 <span class="badge" id="gwActiveCount">—</span></h3>
-          <p class="hint" id="gwActiveHint" aria-live="polite">每秒自动更新，显示正在处理请求的账号和模型</p>
-          <div class="accounts-table-wrap">
-            <table class="accounts-table">
-              <thead><tr><th>账号</th><th>使用平台</th><th>模型</th><th>接口协议</th><th>输出方式</th><th>已持续</th></tr></thead>
-              <tbody id="gwActiveTbody"><tr><td colspan="6" style="text-align:center;color:var(--muted)">加载中…</td></tr></tbody>
-            </table>
-          </div>
         </div>
         <div class="panel" style="margin-bottom:18px">
           <h3>网关设置</h3>
@@ -427,6 +435,42 @@ async function restoreAccount(id){
   }catch(error){alert(`恢复失败：${error.message}`)}
 }
 async function importCurrent(){alert('JSON 导入功能在多账号模式下暂不可用，请使用 curl 导入并刷新')}
+function setConfigTransferBusy(busy){
+  $('#importConfig').disabled=busy;$('#exportConfig').disabled=busy;
+}
+async function exportConfig(){
+  setConfigTransferBusy(true);
+  try{
+    const response=await fetch('/api/config/export',{cache:'no-store'});
+    if(!response.ok)throw new Error('导出请求失败（HTTP '+response.status+'）');
+    const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');
+    link.href=url;link.download='coding-plan-config-'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';
+    document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+  }catch(error){alert('导出失败：'+error.message)}
+  finally{setConfigTransferBusy(false)}
+}
+async function importConfigFile(event){
+  const file=event.target.files[0];event.target.value='';if(!file)return;
+  setConfigTransferBusy(true);
+  try{
+    if(file.size>16*1024*1024)throw new Error('配置文件不能超过 16 MB');
+    let config;
+    try{config=JSON.parse((await file.text()).replace(/^\uFEFF/,''))}catch{throw new Error('请选择有效的 JSON 配置文件')}
+    const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
+    if(!object(config)||config.format!=='coding-plan-dashboard-config'||config.version!==1||!object(config.accounts)||!object(config.sms)||!Array.isArray(config.order))throw new Error('请选择本应用导出的 v1 配置文件');
+    if(!confirm('即将导入 '+Object.keys(config.accounts).length+' 个账号和 '+Object.keys(config.sms).length+' 个接码平台配置。\n\n同 ID 账号及文件内的接码平台配置将被覆盖，其他账号保留。文件中的 Cookie、密码和 Key 将一并保存。\n\n确认导入？'))return;
+    const response=await fetch('/api/config/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)});
+    const result=await response.json();
+    if(!response.ok)throw new Error(result.error||'配置保存失败');
+    try{localStorage.removeItem('coding-plan-quota-snapshot')}catch{}
+    alert('导入成功：新增 '+result.added+' 个账号，更新 '+result.updated+' 个账号，导入 '+result.smsPlatforms+' 个接码平台配置。');
+    location.reload();
+  }catch(error){alert('导入失败：'+error.message)}
+  finally{setConfigTransferBusy(false)}
+}
+$('#importConfig').onclick=()=>$('#configFile').click();
+$('#exportConfig').onclick=exportConfig;
+$('#configFile').onchange=importConfigFile;
 function editGoogleCreds(id){if(locked){lockedAlert();return;}const acc=requestDefinitions[id];if(!acc)return;const card=[...document.querySelectorAll('#cards .card')].find(c=>{const b=c.querySelector('.card-actions button');return b&&b.getAttribute('onclick')&&b.getAttribute('onclick').includes(id)});if(!card)return;let box=card.querySelector('.creds-edit');if(box){box.remove();return}box=document.createElement('div');box.className='creds-edit';box.innerHTML=`<input type="password" placeholder="OAuth Refresh Token（留空保持不变）"><input type="text" placeholder="代理（可选）" value="${escapeHtml(acc.proxy||'')}"><div class="actions"><button class="btn primary" onclick="saveGoogleCreds('${id}',this.parentElement.previousElementSibling.previousElementSibling.value,this.parentElement.previousElementSibling.value)">保存</button></div>`;card.querySelector('.period-list')?.after(box);box.querySelector('input')?.focus()}
 async function saveGoogleCreds(id,refreshToken,proxy){if(locked){lockedAlert();return;}try{const acc=requestDefinitions[id];if(!acc)return;const body={id,label:acc.label||'',curl:acc.curl,updatedAt:now()};if(refreshToken)body.refreshToken=refreshToken;if(proxy)body.proxy=proxy;const response=await fetch('/api/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok)throw new Error(await response.text());requestDefinitions[id]={...acc,hasCreds:true,proxy:proxy||acc.proxy};render();await refreshFromServer()}catch(error){alert(`保存 Token 失败：${error.message}`)}}
 function lockedAlert(){
@@ -447,7 +491,8 @@ function switchPage(pageId, el){
   if(el) el.classList.add('active');
   if(pageId==='accounts') renderAccountsTable();
   gwStopActivePolling();
-  if(pageId==='gateway'){gwLoadConfig();gwPollActive();}
+  if(pageId==='dashboard') gwPollActive();
+  if(pageId==='gateway') gwLoadConfig();
   if(pageId==='sms'){smsLoadPage();}
   if(pageId==='logs'){logsLoad();logsSetAuto();}
   else if(logsTimer){clearInterval(logsTimer);logsTimer=null}
@@ -583,7 +628,7 @@ function gwStopActivePolling(){
   gwActiveController=null;
 }
 async function gwPollActive(){
-  if(document.hidden||!document.getElementById('page-gateway').classList.contains('active')) return;
+  if(document.hidden||!document.getElementById('page-dashboard').classList.contains('active')) return;
   const controller=new AbortController();
   gwActiveController=controller;
   const timeout=setTimeout(()=>controller.abort(),5000);
@@ -615,6 +660,7 @@ async function gwPollActive(){
   }
 }
 document.addEventListener('visibilitychange',()=>{gwStopActivePolling();if(!document.hidden) gwPollActive();});
+gwPollActive();
 
 async function gwLoadConfig(){
   _gwKeyRevealed=false;

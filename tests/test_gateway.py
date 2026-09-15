@@ -3,6 +3,7 @@ import json
 import io
 import os
 import pathlib
+import select
 import socket
 import tempfile
 import threading
@@ -95,6 +96,10 @@ class GatewayProtocolsTest(unittest.TestCase):
         self.stack.enter_context(patch.dict(server._gateway_quota_cache, {}, clear=True))
         self.hold_stream = False
         self.hold_response = False
+        self.open_stream = False
+        self.silent_stream = False
+        self.heartbeat_stream = False
+        self.upstream_disconnected = threading.Event()
         self.release_stream = threading.Event()
         self.upstream_finished = threading.Event()
         owner = self
@@ -102,6 +107,21 @@ class GatewayProtocolsTest(unittest.TestCase):
         class Upstream(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
+
+            def wait_for_client(self):
+                deadline = time.monotonic() + 5
+                while not owner.release_stream.wait(0.02) and time.monotonic() < deadline:
+                    if select.select([self.connection], [], [], 0)[0]:
+                        if not self.connection.recv(1, socket.MSG_PEEK):
+                            owner.upstream_disconnected.set()
+                            return
+                    if owner.heartbeat_stream:
+                        try:
+                            self.wfile.write(b': ping\n\n')
+                            self.wfile.flush()
+                        except OSError:
+                            owner.upstream_disconnected.set()
+                            return
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
@@ -128,8 +148,12 @@ class GatewayProtocolsTest(unittest.TestCase):
                     owner.release_stream.wait(10)
                 self.send_response(status)
                 self.send_header('Content-Type', mime)
-                self.send_header('Content-Length', str(len(data)))
+                if not owner.open_stream:
+                    self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
+                if owner.silent_stream:
+                    self.wait_for_client()
+                    return
                 if owner.hold_stream and body.get('stream'):
                     marker = b'event: content_block_stop' if protocol == 'anthropic' else b'data: {"id"'
                     split = data.find(marker) if protocol == 'anthropic' else data.rfind(marker)
@@ -139,7 +163,10 @@ class GatewayProtocolsTest(unittest.TestCase):
                     self.wfile.write(data[split:])
                 else:
                     self.wfile.write(data)
+                self.wfile.flush()
                 owner.upstream_finished.set()
+                if owner.open_stream:
+                    self.wait_for_client()
 
         class QuietGateway(server.DashboardHandler):
             def log_message(self, *args):
@@ -399,6 +426,70 @@ class GatewayProtocolsTest(unittest.TestCase):
                     self.assertEqual(image_url['detail'], 'high' if adapted else 'original')
                     self.assertEqual(image_url['url'], 'data:image/png;base64,QUJD')
 
+    def test_invalid_codex_reasoning_is_rejected_before_upstream(self):
+        for reasoning in ([], False, 'high', {'effort': 3}, {'summary': 'unsupported'}):
+            with self.subTest(reasoning=reasoning):
+                req = Request(self.gateway + '/v1/responses',
+                              data=json.dumps({'input': 'hello', 'reasoning': reasoning}).encode(),
+                              headers={'x-api-key': 'test-only', 'Originator': 'Codex Desktop'})
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(req, timeout=5)
+                self.assertEqual(error.exception.code, 400)
+                error.exception.close()
+        self.assertEqual(self.requests, [])
+        self.wait_active(0)
+
+    def test_codex_responses_reasoning_is_scoped_and_translated_over_http(self):
+        from test_codex_reasoning import chat, frame
+        for upstream in ('openai', 'anthropic'):
+            self.config['upstreams'] = {'test': {
+                'openaiBaseUrl' if upstream == 'openai' else 'anthropicBaseUrl': self.upstream}}
+            for stream in (False, True):
+                for client_headers, summary, enabled in (
+                    ({'Originator': 'Codex Desktop'}, 'auto', True),
+                    ({'User-Agent': 'codex_cli_rs/1.0'}, 'detailed', True),
+                    ({'Originator': 'Codex Desktop'}, 'none', False),
+                    ({'Originator': 'ZCode'}, 'auto', False),
+                ):
+                    with self.subTest(upstream=upstream, stream=stream, headers=client_headers, summary=summary):
+                        if upstream == 'openai':
+                            reply = {'choices': [{'message': {'reasoning_content': 'synthetic analysis',
+                                                              'content': 'answer'}, 'finish_reason': 'stop'}]}
+                            data = (chat({'reasoning_content': 'synthetic analysis'})
+                                    + chat({'content': 'answer'}, 'stop') + b'data: [DONE]\n\n')
+                        else:
+                            reply = {'content': [{'type': 'thinking', 'thinking': 'synthetic analysis'},
+                                                 {'type': 'text', 'text': 'answer'}], 'stop_reason': 'end_turn'}
+                            data = frame({'type': 'content_block_delta', 'index': 0,
+                                          'delta': {'type': 'thinking_delta', 'thinking': 'synthetic analysis'}})
+                            data += frame({'type': 'content_block_delta', 'index': 1,
+                                           'delta': {'type': 'text_delta', 'text': 'answer'}})
+                            data += frame({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}})
+                            data += frame({'type': 'message_stop'})
+                        self.failure = (200, data if stream else json.dumps(reply).encode(),
+                                        'text/event-stream' if stream else 'application/json')
+                        body = {'model': 'test-model', 'input': 'hello', 'stream': stream,
+                                'reasoning': {'effort': 'high', 'summary': summary}}
+                        req = Request(self.gateway + '/v1/responses', data=json.dumps(body).encode(),
+                                      headers={'x-api-key': 'test-only', **client_headers})
+                        with urlopen(req, timeout=5) as response:
+                            payload = response.read().decode()
+                        result = ([json.loads(line[6:]) for line in payload.splitlines()
+                                   if line.startswith('data: ')][-1]['response'] if stream else json.loads(payload))
+                        output = result['output']
+                        self.assertEqual([i['type'] for i in output],
+                                         ['reasoning', 'message'] if enabled else ['message'])
+                        if enabled:
+                            self.assertEqual(output[0]['summary'][0]['text'], 'synthetic analysis')
+                        self.assertEqual(output[-1]['content'][0]['text'], 'answer')
+                        sent = self.requests[-1][1]
+                        if upstream == 'openai' and client_headers.get('Originator') != 'ZCode':
+                            self.assertEqual(sent['reasoning_effort'], 'high')
+                        else:
+                            self.assertNotIn('reasoning_effort', sent)
+                        self.assertNotIn('reasoning', sent)
+                        self.wait_active(0)
+
     def test_upstream_errors_are_not_successful_empty_messages(self):
         self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream}}
         for protocol in ('openai', 'anthropic', 'responses'):
@@ -478,6 +569,68 @@ class GatewayProtocolsTest(unittest.TestCase):
                                 self.assertEqual(ids[3], 'second')
                                 self.assertIn('first', self.routing_states[3][1])
                             self.wait_active(0)
+
+    def test_terminal_event_releases_upstream_without_waiting_for_eof(self):
+        self.open_stream = True
+        self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream, 'anthropicBaseUrl': self.upstream}}
+        for protocol in ('openai', 'anthropic', 'responses'):
+            with self.subTest(protocol=protocol):
+                self.upstream_disconnected.clear()
+                with self.call(protocol, True) as response:
+                    output = response.read()
+                self.assertIn('你好'.encode(), output)
+                self.wait_active(0)
+                self.assertTrue(self.upstream_disconnected.wait(1))
+
+    def test_idle_stream_closes_without_retrying_after_headers(self):
+        self.open_stream = self.silent_stream = True
+        self.config['maxRetries'] = 3
+        self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream, 'anthropicBaseUrl': self.upstream}}
+        with patch.object(server, 'GATEWAY_STREAM_IDLE_TIMEOUT', 0.3), \
+             patch.object(server, 'GATEWAY_STREAM_POLL_INTERVAL', 0.01):
+            for protocol in ('openai', 'anthropic', 'responses'):
+                with self.subTest(protocol=protocol):
+                    self.upstream_disconnected.clear()
+                    count = len(self.requests)
+                    with self.call(protocol, True) as response:
+                        output = response.read()
+                    self.wait_active(0)
+                    self.assertEqual(len(self.requests), count + 1)
+                    self.assertNotIn(b'HTTP/1.', output)
+                    self.assertNotIn(b'response.completed', output)
+                    self.assertTrue(self.upstream_disconnected.wait(1))
+
+    def test_disconnected_client_cancels_silent_upstream_promptly(self):
+        self.open_stream = self.silent_stream = True
+        self.config['maxRetries'] = 3
+        self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream, 'anthropicBaseUrl': self.upstream}}
+        for protocol in ('openai', 'anthropic', 'responses'):
+            with self.subTest(protocol=protocol):
+                self.upstream_disconnected.clear()
+                count = len(self.requests)
+                response = self.call(protocol, True)
+                self.wait_active(1)
+                response.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+                response.close()
+                self.assertTrue(self.upstream_disconnected.wait(1))
+                self.wait_active(0)
+                self.assertEqual(len(self.requests), count + 1)
+
+    def test_upstream_heartbeats_keep_responses_stream_alive(self):
+        self.open_stream = self.silent_stream = self.heartbeat_stream = True
+        self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream}}
+        with patch.object(server, 'GATEWAY_STREAM_IDLE_TIMEOUT', 0.3), \
+             patch.object(server, 'GATEWAY_STREAM_POLL_INTERVAL', 0.01):
+            response = self.call('responses', True)
+            try:
+                # Heartbeats produce no Responses events, but are upstream activity.
+                time.sleep(0.7)
+                self.assertEqual(server.gateway_active_snapshot()['activeCount'], 1)
+            finally:
+                response.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+                response.close()
+            self.assertTrue(self.upstream_disconnected.wait(1))
+            self.wait_active(0)
 
     def test_stream_connection_failure_retries_without_leaking_active_requests(self):
         accounts = {'first': {'apiKey': 'test-only'}, 'second': {'apiKey': 'test-only'}}
