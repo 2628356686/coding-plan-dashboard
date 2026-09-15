@@ -97,6 +97,23 @@ AGENTS.md           Coding-agent instructions for this repository
 
 ## Quick Start (Docker)
 
+### Codex protocol compatibility
+
+The gateway enables Codex-specific protocol compatibility only when the detected client name
+is `codex` or starts with `codex` followed by a space, `_`, `-`, or `/` (case-insensitive).
+`Originator` takes priority; otherwise the client name comes from `User-Agent`.
+Other clients and requests without these identifiers retain their existing behavior.
+
+Codex Anthropic-to-Chat fallback, including streaming requests, preserves
+supported tool definitions, calls, results, and images; unsupported
+content blocks fail explicitly instead of disappearing during conversion.
+
+This is not a new official Responses passthrough route: the existing Responses
+bridge still translates to Chat/Anthropic upstreams and needs full history rather
+than server-side item references or `previous_response_id`. Requests sent directly
+to CC Switch's official proxy bypass this gateway and are unaffected. Existing
+Codex session files are not modified.
+
 ### Requirements
 
 - Linux host / NAS with Docker Engine and Docker Compose v2.

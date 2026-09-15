@@ -6,6 +6,12 @@
 - Keep credentials out of source code, tests, README, and commits.
 - Do not add real curl commands containing Token, Cookie, Digest, or proxy credentials to fixtures.
 
+## Windows Computer Use
+
+- For Windows desktop control, read the installed `computer-use:computer-use` skill and use `mcp__node_repl__js` to import `@oai/sky`. Discover the tool if it is not yet exposed.
+- `mcp__cua_repl__js` is the browser runtime, not the desktop `node_repl` runtime. Do not import `@oai/sky` there or infer that Windows control is unavailable from its browser-only API.
+- If `Trusted RPC service is not configured: sky` occurs in `cua_repl`, retry initialization in the correct `node_repl` tool before diagnosing the desktop service as unavailable.
+
 ## Validation
 
 - Run `node --test tests/parser.test.js` after parser changes.

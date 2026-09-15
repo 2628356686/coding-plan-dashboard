@@ -191,6 +191,31 @@ class GatewayProtocolsTest(unittest.TestCase):
         self.stack.enter_context(patch.object(server, 'gateway_category_for_account', return_value='test'))
         self.stack.enter_context(patch.object(server, 'record_gateway_request'))
 
+    def test_codex_anthropic_fallback_tools_over_http(self):
+        from test_codex_compat import history
+        self.config['upstreams'] = {'test': {'openaiBaseUrl': self.upstream}}
+        reply = {'choices': [{'message': {'tool_calls': [{'id': 'call_next', 'type': 'function',
+            'function': {'name': 'check', 'arguments': '{"x":1}'}}]}, 'finish_reason': 'tool_calls'}]}
+        self.failure = (200, json.dumps(reply).encode(), 'application/json')
+        for stream in (False, True):
+            body = dict(history('anthropic'), model='test-model', stream=stream,
+                tools=[{'name': 'check', 'input_schema': {'type': 'object'}}])
+            req = Request(self.gateway + '/v1/messages', data=json.dumps(body).encode(),
+                headers={'x-api-key': 'test-only', 'Content-Type': 'application/json', 'Originator': 'codex'})
+            with urlopen(req, timeout=5) as response:
+                payload = response.read().decode()
+            forwarded = self.requests[-1][1]
+            self.assertEqual(forwarded['tools'][0]['function']['name'], 'check')
+            self.assertEqual(forwarded['messages'][0]['tool_calls'][0]['id'], forwarded['messages'][1]['tool_call_id'])
+            if stream:
+                events = [json.loads(line[6:]) for line in payload.splitlines() if line.startswith('data: ')]
+                start = next(e for e in events if e['type'] == 'content_block_start')
+                self.assertEqual(start['content_block']['id'], 'call_next')
+                delta = next(e for e in events if e['type'] == 'content_block_delta')
+                self.assertEqual(json.loads(delta['delta']['partial_json']), {'x': 1})
+            else:
+                self.assertEqual(json.loads(payload)['content'][0]['id'], 'call_next')
+
     def call(self, protocol, stream, model='test-model'):
         paths = {'openai': '/v1/chat/completions', 'anthropic': '/v1/messages', 'responses': '/v1/responses'}
         body = {'model': model, 'stream': stream, 'max_tokens': 100,
@@ -1113,6 +1138,41 @@ class OpenLoginTest(unittest.TestCase):
         if found is not None:
             self.assertEqual(len(found), 2)
             self.assertIn(found[1], ('--incognito', '--inprivate', '-private-window'))
+
+
+class CodexSystemPromptTest(unittest.TestCase):
+    def test_responses_instructions_appended(self):
+        body = {'instructions': 'harness rules', 'input': []}
+        result = server.inject_codex_system_prompt(body, 'responses', 'platform rules')
+        self.assertEqual(result['instructions'], 'harness rules\n\nplatform rules')
+
+    def test_responses_instructions_created_when_missing(self):
+        result = server.inject_codex_system_prompt({'input': []}, 'responses', 'platform rules')
+        self.assertEqual(result['instructions'], 'platform rules')
+
+    def test_openai_system_message_appended_and_created(self):
+        body = {'messages': [{'role': 'system', 'content': 'sys'},
+                             {'role': 'user', 'content': 'hi'}]}
+        result = server.inject_codex_system_prompt(body, 'openai', 'extra')
+        self.assertEqual(result['messages'][0]['content'], 'sys\n\nextra')
+        body = {'messages': [{'role': 'user', 'content': 'hi'}]}
+        result = server.inject_codex_system_prompt(body, 'openai', 'extra')
+        self.assertEqual(result['messages'][0], {'role': 'system', 'content': 'extra'})
+        self.assertEqual(result['messages'][1]['content'], 'hi')
+
+    def test_anthropic_system_shapes(self):
+        result = server.inject_codex_system_prompt({'system': 'sys'}, 'anthropic', 'extra')
+        self.assertEqual(result['system'], 'sys\n\nextra')
+        body = {'system': [{'type': 'text', 'text': 'sys'}]}
+        result = server.inject_codex_system_prompt(body, 'anthropic', 'extra')
+        self.assertEqual(result['system'][-1], {'type': 'text', 'text': 'extra'})
+        result = server.inject_codex_system_prompt({}, 'anthropic', 'extra')
+        self.assertEqual(result['system'], 'extra')
+
+    def test_empty_prompt_is_noop(self):
+        body = {'instructions': 'keep'}
+        result = server.inject_codex_system_prompt(body, 'responses', '   ')
+        self.assertEqual(result['instructions'], 'keep')
 
 
 if __name__ == '__main__':

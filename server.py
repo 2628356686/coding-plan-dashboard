@@ -779,6 +779,7 @@ def load_gateway_config():
         "apiKey": "",
         "defaultModel": "",
         "maxRetries": 3,
+        "codexSystemPrompt": "",
         "upstreams": {
             "agentPlan": {
                 "anthropicBaseUrl": "https://ark.cn-beijing.volces.com/api/plan",
@@ -928,6 +929,48 @@ def detect_gateway_agent_platform(headers):
     return "unknown"
 
 
+def is_codex_gateway_platform(platform):
+    """Match Codex client names, not arbitrary strings containing 'codex'."""
+    return bool(re.match(r"^codex(?:$|[\s_/-])", str(platform).strip(), re.I))
+
+
+def inject_codex_system_prompt(body, inbound_format, prompt):
+    """Append the configured Codex platform prompt to system instructions.
+
+    The prompt is appended so harness instructions stay intact, and supports
+    all three inbound protocols' system shapes: Responses "instructions",
+    Anthropic "system" (string or content-block list), and OpenAI system
+    messages.
+    """
+    prompt = str(prompt or "").strip()
+    if not prompt:
+        return body
+    if inbound_format == "responses":
+        existing = str(body.get("instructions") or "").strip()
+        body["instructions"] = f"{existing}\n\n{prompt}" if existing else prompt
+    elif inbound_format == "anthropic":
+        existing = body.get("system")
+        if isinstance(existing, list):
+            existing.append({"type": "text", "text": prompt})
+        elif isinstance(existing, str) and existing.strip():
+            body["system"] = f"{existing.rstrip()}\n\n{prompt}"
+        else:
+            body["system"] = prompt
+    else:
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            messages = []
+            body["messages"] = messages
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") == "system":
+                content = str(message.get("content") or "").strip()
+                message["content"] = f"{content}\n\n{prompt}" if content else prompt
+                break
+        else:
+            messages.insert(0, {"role": "system", "content": prompt})
+    return body
+
+
 # ---- Protocol conversion (inbound -> OpenAI upstream) ----
 
 def anthropic_image_to_openai_url(source):
@@ -942,7 +985,9 @@ def anthropic_image_to_openai_url(source):
     return str(source.get("url") or "")
 
 
-def anthropic_to_openai(body):
+def anthropic_to_openai(body, codex_compat=False):
+    if codex_compat:
+        return codex_anthropic_to_openai(body)
     messages = []
     if body.get("system"):
         sys_content = body["system"]
@@ -981,11 +1026,11 @@ def anthropic_to_openai(body):
     return result
 
 
-def openai_to_anthropic(body, model):
+def openai_to_anthropic(body, model, codex_compat=False):
     choice = (body.get("choices") or [{}])[0]
     message = choice.get("message", {})
     content = message.get("content", "") or ""
-    return {
+    result = {
         "id": body.get("id", "msg_" + uuid.uuid4().hex[:16]),
         "type": "message",
         "role": "assistant",
@@ -997,6 +1042,71 @@ def openai_to_anthropic(body, model):
             "output_tokens": body.get("usage", {}).get("completion_tokens", 0),
         },
     }
+    if codex_compat:
+        result["id"] = "msg_" + uuid.uuid4().hex
+        result["content"] = [{"type": "text", "text": content}] if content else []
+        finish = choice.get("finish_reason")
+        result["stop_reason"] = "max_tokens" if finish == "length" else "end_turn"
+        if finish != "length":
+            for call in message.get("tool_calls") or []:
+                result["content"].append({"type": "tool_use", "id": call["id"],
+                    "name": call["function"]["name"],
+                    "input": json.loads(call["function"].get("arguments") or "{}")})
+            if message.get("tool_calls"):
+                result["stop_reason"] = "tool_use"
+    return result
+
+
+def codex_anthropic_to_openai(body):
+    """Use the tool-aware Responses bridge for Codex Anthropic fallback."""
+    history = []
+    for message in body.get("messages", []):
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            history.append({"role": message["role"], "content": content})
+            continue
+        for block in content:
+            kind = block.get("type")
+            if kind == "tool_use":
+                history.append({"type": "function_call", "call_id": block["id"],
+                    "name": block["name"], "arguments": json.dumps(block.get("input", {}), ensure_ascii=False)})
+            elif kind == "tool_result":
+                output = block.get("content", "")
+                if isinstance(output, list):
+                    output = [anthropic_history_part_to_responses(part) for part in output]
+                history.append({"type": "function_call_output", "call_id": block["tool_use_id"], "output": output})
+            else:
+                history.append({"role": message["role"], "content": [anthropic_history_part_to_responses(block)]})
+    request = {"input": history, "tools": [{"type": "function", "name": tool["name"],
+        "description": tool.get("description", ""), "parameters": tool["input_schema"]}
+        for tool in body.get("tools", [])]}
+    system = body.get("system")
+    if system:
+        request["instructions"] = ("\n".join(part["text"] for part in system)
+                                   if isinstance(system, list) else system)
+    choice = body.get("tool_choice")
+    if choice:
+        request["tool_choice"] = ({"type": "function", "name": choice["name"]}
+            if choice["type"] == "tool" else "required" if choice["type"] == "any" else choice["type"])
+        if choice.get("disable_parallel_tool_use"):
+            request["parallel_tool_calls"] = False
+    for key in ("model", "temperature", "top_p", "stream"):
+        if key in body:
+            request[key] = body[key]
+    if "max_tokens" in body:
+        request["max_output_tokens"] = body["max_tokens"]
+    return responses_to_openai(request)
+
+
+def anthropic_history_part_to_responses(part):
+    """Convert a supported Anthropic history part without dropping unknown data."""
+    if part.get("type") == "text":
+        return {"type": "input_text", "text": part.get("text", "")}
+    if part.get("type") == "image":
+        url = anthropic_image_to_openai_url(part.get("source"))
+        if url:
+            return {"type": "input_image", "image_url": url}
+    raise ValueError("unsupported Codex Anthropic history content type")
 
 
 def normalize_volcengine_image_detail(body):
@@ -1532,7 +1642,7 @@ def gateway_responses_stream(stream, protocol, model, tool_context=None, include
     yield emit("response." + response["status"], response=response)
 
 
-def gateway_message_events(message, protocol):
+def gateway_message_events(message, protocol, codex_compat=False):
     """Encode a buffered converted reply using the caller's SSE protocol."""
     events = []
 
@@ -1544,6 +1654,13 @@ def gateway_message_events(message, protocol):
         start = dict(message, content=[], stop_reason=None, stop_sequence=None)
         emit("message_start", {"type": "message_start", "message": start})
         for index, block in enumerate(message.get("content", [])):
+            if codex_compat and block.get("type") == "tool_use":
+                emit("content_block_start", {"type": "content_block_start", "index": index,
+                    "content_block": dict(block, input={})})
+                emit("content_block_delta", {"type": "content_block_delta", "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": json.dumps(block["input"], ensure_ascii=False)}})
+                emit("content_block_stop", {"type": "content_block_stop", "index": index})
+                continue
             emit("content_block_start", {"type": "content_block_start", "index": index,
                  "content_block": {"type": "text", "text": ""}})
             emit("content_block_delta", {"type": "content_block_delta", "index": index,
@@ -2537,11 +2654,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.send_error(401, "invalid gateway api key")
             return
         platform = detect_gateway_agent_platform(self.headers)
-        codex_responses = inbound_format == "responses" and "codex" in platform.lower()
+        codex_responses = inbound_format == "responses" and is_codex_gateway_platform(platform)
         try:
             body, _raw = self._gateway_read_body()
             if not isinstance(body, dict):
                 raise ValueError("request body must be a JSON object")
+            if is_codex_gateway_platform(platform):
+                body = inject_codex_system_prompt(
+                    body, inbound_format, config.get("codexSystemPrompt", ""))
             tool_context = {} if inbound_format == "responses" else None
             responses_body = responses_to_openai(body, tool_context) if inbound_format == "responses" else None
             reasoning = body.get("reasoning") if codex_responses else None
@@ -2607,7 +2727,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 elif inbound_format == "openai" and upstream_protocol == "anthropic":
                     upstream_body = openai_to_anthropic_request(body)
                 elif inbound_format == "anthropic" and upstream_protocol == "openai":
-                    upstream_body = anthropic_to_openai(body)
+                    try:
+                        upstream_body = anthropic_to_openai(body, is_codex_gateway_platform(platform))
+                    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                        self._gateway_write_json(400, {"error": {"type": "invalid_request_error", "message": str(exc)}})
+                        return
                 elif inbound_format == "responses" and upstream_protocol == "openai":
                     upstream_body = dict(responses_body)
                 elif inbound_format == "responses" and upstream_protocol == "anthropic":
@@ -2620,7 +2744,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     # Chat uses a flat effort field. Preserve the requested value;
                     # supported levels depend on the configured upstream model.
                     upstream_body["reasoning_effort"] = effort
-                if platform and "codex" in platform.lower() \
+                if is_codex_gateway_platform(platform) \
                         and upstream_protocol == "openai" and category in {"agentPlan", "codingPlan"}:
                     upstream_body = normalize_volcengine_image_detail(upstream_body)
                 # Upstream path
@@ -2701,7 +2825,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     if upstream_protocol == inbound_format:
                         out_bytes = resp_body
                     elif upstream_protocol == "openai" and inbound_format == "anthropic":
-                        out = openai_to_anthropic(upstream_json, out_model) if isinstance(upstream_json, dict) else None
+                        try:
+                            out = openai_to_anthropic(upstream_json, out_model, is_codex_gateway_platform(platform))
+                        except (ValueError, TypeError, KeyError):
+                            self._gateway_write_json(502, {"error": {"message": "invalid upstream tool call"}})
+                            return
                         out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8") if out else resp_body
                     elif upstream_protocol == "openai" and inbound_format == "responses":
                         try:
@@ -2730,7 +2858,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         out_bytes = resp_body
 
                     if stream:
-                        out_bytes = gateway_message_events(json.loads(out_bytes), inbound_format)
+                        out_bytes = gateway_message_events(json.loads(out_bytes), inbound_format, is_codex_gateway_platform(platform))
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream; charset=utf-8" if stream else "application/json; charset=utf-8")
                     self.send_header("Content-Length", str(len(out_bytes)))
@@ -2888,6 +3016,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         for key in ("enabled", "apiKey", "defaultModel", "maxRetries"):
             if key in payload:
                 config[key] = payload[key]
+        if "codexSystemPrompt" in payload:
+            config["codexSystemPrompt"] = str(payload["codexSystemPrompt"] or "")
         if isinstance(payload.get("upstreams"), dict):
             for cat in ("agentPlan", "codingPlan"):
                 if cat in payload["upstreams"] and isinstance(payload["upstreams"][cat], dict):
