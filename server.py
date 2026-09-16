@@ -120,9 +120,8 @@ def volc_sign_request(access_key_id, secret_access_key, action, body=b"{}"):
     content_sha256 = hashlib.sha256(body_bytes).hexdigest()
     canonical_request = "\n".join([
         "POST", path, query,
-        "host:" + host + "\nx-content-sha256:" + content_sha256 + "\nx-date:" + x_date,
-        "",
-        "host;x-content-sha256;x-date",
+        "content-type:application/json\nhost:" + host + "\nx-content-sha256:" + content_sha256 + "\nx-date:" + x_date,
+        "content-type;host;x-content-sha256;x-date",
         content_sha256,
     ])
     credential_scope = "/".join([date_short, VOLC_REGION, VOLC_SERVICE, "request"])
@@ -138,7 +137,7 @@ def volc_sign_request(access_key_id, secret_access_key, action, body=b"{}"):
     k_signing = _volc_hmac(k_service, "request")
     signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
     authorization = (
-        "HMAC-SHA256 Credential=%s/%s, SignedHeaders=host;x-content-sha256;x-date, Signature=%s"
+        "HMAC-SHA256 Credential=%s/%s, SignedHeaders=content-type;host;x-content-sha256;x-date, Signature=%s"
         % (access_key_id, credential_scope, signature)
     )
     request = Request(
