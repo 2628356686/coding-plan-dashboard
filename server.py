@@ -874,11 +874,13 @@ def gateway_quota_worker(requests_path, stop):
 
 
 @contextmanager
-def reserve_gateway_account(accounts, snapshot, model, protocol, stream, platform="unknown"):
+def reserve_gateway_account(accounts, snapshot, model, protocol, stream, platform="unknown",
+                            affinity_key=None):
     # Selection and reservation share a lock so simultaneous requests see each other.
     with ExitStack() as stack:
         with _gateway_active_lock:
-            aid, account = select_gateway_account(accounts, gateway_routing_snapshot(snapshot))
+            aid, account = select_gateway_account(
+                accounts, gateway_routing_snapshot(snapshot), affinity_key=affinity_key)
             if aid:
                 request_id = stack.enter_context(
                     track_gateway_request(aid, account, model, protocol, stream, platform))
@@ -895,7 +897,7 @@ def track_gateway_request(account_id, account, model, protocol, stream, platform
         "accountLabel": account.get("label") or account.get("accountId") or account_id,
         "model": model, "protocol": protocol, "stream": bool(stream),
         "platform": platform,
-        "inputTokens": None, "outputTokens": 0,
+        "inputTokens": None, "cachedTokens": None, "outputTokens": 0,
         "inputTokensEstimated": True, "outputTokensEstimated": True,
         "startedAt": now_iso(), "startedMonotonic": time.monotonic(),
     }
@@ -930,6 +932,7 @@ def gateway_active_snapshot():
                   for entry in _gateway_recent.values()]
         totals = {
             "inputTokens": _gateway_stats.get("input_tokens", 0),
+            "cachedTokens": _gateway_stats.get("cached_tokens", 0),
             "outputTokens": _gateway_stats.get("output_tokens", 0),
             "totalTokens": _gateway_stats.get("total_tokens", 0),
         }
@@ -970,7 +973,12 @@ def normalize_gateway_usage(usage):
         return None
     input_tokens = max(0, int(input_tokens or 0))
     output_tokens = max(0, int(output_tokens or 0))
-    return {"inputTokens": input_tokens, "outputTokens": output_tokens,
+    details = usage.get("prompt_tokens_details", usage.get("input_tokens_details", {}))
+    cached_tokens = details.get("cached_tokens") if isinstance(details, dict) else None
+    cached_tokens = (max(0, min(input_tokens, int(cached_tokens)))
+                     if isinstance(cached_tokens, (int, float)) else None)
+    return {"inputTokens": input_tokens, "cachedTokens": cached_tokens,
+            "outputTokens": output_tokens,
             "totalTokens": max(0, int(usage.get("total_tokens", input_tokens + output_tokens) or 0))}
 
 
@@ -1104,8 +1112,8 @@ def gateway_concurrency_limit(account):
     return value if type(value) is int and 1 <= value <= 10 else 1
 
 
-def select_gateway_account(accounts, snapshot):
-    """Weighted-random pick by remaining quota. Returns (aid, acc) or (None, None)."""
+def select_gateway_account(accounts, snapshot, affinity_key=None):
+    """Pick an available account, preserving cache locality when a key is supplied."""
     now = time.time()
     candidates = []
     weights = []
@@ -1134,8 +1142,43 @@ def select_gateway_account(accounts, snapshot):
         weights.append(weight)
     if not candidates:
         return None, None
+    if isinstance(affinity_key, str) and affinity_key:
+        # Rendezvous hashing keeps a stable prefix on one account without storing
+        # prompts or session IDs. Capacity, cooldown and quota checks above still
+        # take precedence, so an unavailable preferred account fails over safely.
+        chosen = max(candidates, key=lambda aid: hashlib.sha256(
+            (affinity_key + "\0" + aid).encode("utf-8")).digest())
+        return chosen, accounts[chosen]
     chosen = random.choices(candidates, weights=weights, k=1)[0]
     return chosen, accounts[chosen]
+
+
+def gateway_cache_affinity_key(body, model=""):
+    """Hash a reusable prompt prefix for account-local cache routing."""
+    if not isinstance(body, dict):
+        return None
+    explicit = body.get("prompt_cache_key")
+    if isinstance(explicit, str) and explicit.strip():
+        material = {"model": str(model or body.get("model") or ""),
+                    "prompt_cache_key": explicit.strip()}
+    else:
+        stable_prefix = {}
+        for key in ("instructions", "system", "tools"):
+            if body.get(key) not in (None, "", []):
+                stable_prefix[key] = body[key]
+        messages = body.get("messages")
+        if isinstance(messages, list):
+            system_messages = [item for item in messages if isinstance(item, dict)
+                               and item.get("role") in ("system", "developer")]
+            if system_messages:
+                stable_prefix["messages"] = system_messages
+        if not stable_prefix:
+            return None
+        material = {"model": str(model or body.get("model") or ""),
+                    "prefix": stable_prefix}
+    encoded = json.dumps(material, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def cooldown_account(account_id, seconds=GATEWAY_COOLDOWN_SECONDS, reason=""):
@@ -1154,6 +1197,7 @@ def record_gateway_request(account_id, platform="unknown", usage=None):
         by_platform[platform] = by_platform.get(platform, 0) + 1
         if normalized is not None:
             _gateway_stats["input_tokens"] = _gateway_stats.get("input_tokens", 0) + normalized["inputTokens"]
+            _gateway_stats["cached_tokens"] = _gateway_stats.get("cached_tokens", 0) + (normalized["cachedTokens"] or 0)
             _gateway_stats["output_tokens"] = _gateway_stats.get("output_tokens", 0) + normalized["outputTokens"]
             _gateway_stats["total_tokens"] = _gateway_stats.get("total_tokens", 0) + normalized["totalTokens"]
     try:
@@ -1169,6 +1213,7 @@ def record_gateway_usage(usage):
         return
     with _gateway_active_lock:
         _gateway_stats["input_tokens"] = _gateway_stats.get("input_tokens", 0) + normalized["inputTokens"]
+        _gateway_stats["cached_tokens"] = _gateway_stats.get("cached_tokens", 0) + (normalized["cachedTokens"] or 0)
         _gateway_stats["output_tokens"] = _gateway_stats.get("output_tokens", 0) + normalized["outputTokens"]
         _gateway_stats["total_tokens"] = _gateway_stats.get("total_tokens", 0) + normalized["totalTokens"]
     try:
@@ -2975,13 +3020,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         max_retries = max(1, min(10, int(config.get("maxRetries", 3))))
         stream = bool(body.get("stream", False))
         model = body.get("model") or config.get("defaultModel", "")
+        affinity_key = gateway_cache_affinity_key(body, model)
         last_error = ""
         started = time.monotonic()
         log.info("gw request %s model=%s stream=%s protocol=%s platform=%s",
                  self.path, model or "-", stream, inbound_format, platform or "-")
 
         for _account_attempt in range(max(1, len(accounts))):
-            with reserve_gateway_account(accounts, snapshot, model, inbound_format, stream, platform) as (aid, acc, request_id):
+            with reserve_gateway_account(
+                    accounts, snapshot, model, inbound_format, stream, platform,
+                    affinity_key=affinity_key) as (aid, acc, request_id):
                 if not aid:
                     d = self._gateway_diagnostics(accounts)
                     msg = "no available gateway accounts (accounts may be at concurrency limit, cooling down, or out of quota; total %d, disabled %d, missing apiKey %d)" % (

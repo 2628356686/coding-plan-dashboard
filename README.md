@@ -84,6 +84,14 @@ implemented and return an explicit error rather than silently losing context.
 Screenshots must be inline data or image URLs. A truncated tool stream is not
 reported as a successfully completed tool call.
 
+For account-local prompt-cache reuse, requests with the same `prompt_cache_key`
+are routed to the same available upstream account. When that field is absent, a
+hash of the stable model/instructions/tools prefix provides the affinity key.
+Busy, cooling, disabled, or exhausted accounts still fail over normally. Prompt
+text and session identifiers are not stored in the affinity state. When upstream
+usage includes `cached_tokens`, the live gateway table shows the count and hit
+percentage; unsupported upstreams display no cache value.
+
 ## File Layout
 
 ```text

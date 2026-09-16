@@ -1003,13 +1003,16 @@ class AgentPlatformTest(unittest.TestCase):
             with server.track_gateway_request('acc', {'label': 'Example'}, 'model', 'openai', True, 'Codex Desktop') as request_id:
                 server.update_gateway_request_estimate(request_id, input_tokens=11, output_tokens=2)
                 estimated = server.gateway_active_snapshot()['activeRequests'][0]
-                server.update_gateway_request_usage(request_id, {'prompt_tokens': 12, 'completion_tokens': 3})
+                server.update_gateway_request_usage(request_id, {
+                    'prompt_tokens': 12, 'completion_tokens': 3,
+                    'prompt_tokens_details': {'cached_tokens': 8}})
                 active = server.gateway_active_snapshot()['activeRequests'][0]
             completed = server.gateway_active_snapshot()['activeRequests'][0]
         self.assertTrue(estimated['inputTokensEstimated'])
         self.assertEqual(estimated['outputTokens'], 2)
         self.assertEqual(active['platform'], 'Codex Desktop')
         self.assertEqual(active['inputTokens'], 12)
+        self.assertEqual(active['cachedTokens'], 8)
         self.assertEqual(active['outputTokens'], 3)
         self.assertFalse(active['inputTokensEstimated'])
         self.assertTrue(completed['completed'])
@@ -1031,12 +1034,15 @@ class AgentPlatformTest(unittest.TestCase):
             with patch.object(server, 'GATEWAY_STATS_PATH', stats_path), \
                  patch.dict(server._gateway_stats, initial, clear=True):
                 server.record_gateway_request('acc', 'Codex Desktop',
-                                              {'prompt_tokens': 10, 'completion_tokens': 4, 'total_tokens': 14})
+                                              {'prompt_tokens': 10, 'completion_tokens': 4, 'total_tokens': 14,
+                                               'prompt_tokens_details': {'cached_tokens': 6}})
                 server.record_gateway_usage({'input_tokens': 2, 'output_tokens': 1})
                 totals = server.gateway_active_snapshot()['tokenTotals']
                 saved = json.loads(stats_path.read_text(encoding='utf-8'))
-        self.assertEqual(totals, {'inputTokens': 12, 'outputTokens': 5, 'totalTokens': 17})
+        self.assertEqual(totals, {'inputTokens': 12, 'cachedTokens': 6,
+                                  'outputTokens': 5, 'totalTokens': 17})
         self.assertEqual(saved['total_tokens'], 17)
+        self.assertEqual(saved['cached_tokens'], 6)
 
     def test_sse_logger_records_structure_without_payload(self):
         logger = server.GatewaySSELogger('request-secret', 'openai')
@@ -1051,6 +1057,31 @@ class AgentPlatformTest(unittest.TestCase):
 
 
 class RoutingTest(unittest.TestCase):
+    def test_cache_affinity_is_stable_and_fails_over_when_preferred_is_busy(self):
+        accounts = {
+            'a': {'apiKey': 'test-only'},
+            'b': {'apiKey': 'test-only'},
+        }
+        key = server.gateway_cache_affinity_key({
+            'model': 'm', 'prompt_cache_key': 'project-session'}, 'm')
+        first = server.select_gateway_account(accounts, {}, affinity_key=key)[0]
+        self.assertEqual(
+            server.select_gateway_account(accounts, {}, affinity_key=key)[0], first)
+        with server.track_gateway_request(first, accounts[first], 'm', 'responses', True):
+            fallback = server.select_gateway_account(accounts, {}, affinity_key=key)[0]
+        self.assertIn(fallback, accounts)
+        self.assertNotEqual(fallback, first)
+
+    def test_cache_affinity_uses_stable_prefix_not_dynamic_input(self):
+        base = {'model': 'm', 'instructions': 'same rules',
+                'tools': [{'type': 'function', 'name': 'run'}]}
+        first = server.gateway_cache_affinity_key({**base, 'input': 'first question'}, 'm')
+        second = server.gateway_cache_affinity_key({**base, 'input': 'different question'}, 'm')
+        changed = server.gateway_cache_affinity_key(
+            {**base, 'instructions': 'changed rules', 'input': 'first question'}, 'm')
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, changed)
+
     def test_default_limit_and_capacity_recovery(self):
         accounts = {'a': {'apiKey': 'test-only'}}
         self.assertEqual(server.gateway_concurrency_limit(accounts['a']), 1)

@@ -144,8 +144,8 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
     <p class="hint" id="gwActiveHint" aria-live="polite">每秒自动更新，显示正在处理请求的账号和模型</p>
     <div class="accounts-table-wrap">
       <table class="accounts-table">
-        <thead><tr><th>账号</th><th>使用平台</th><th>模型</th><th>接口协议</th><th>输入 Token</th><th>输出 Token</th><th>输出方式</th><th>已持续</th></tr></thead>
-        <tbody id="gwActiveTbody"><tr><td colspan="8" style="text-align:center;color:var(--muted)">加载中…</td></tr></tbody>
+        <thead><tr><th>账号</th><th>使用平台</th><th>模型</th><th>接口协议</th><th>输入 Token</th><th>缓存 Token</th><th>输出 Token</th><th>输出方式</th><th>已持续</th></tr></thead>
+        <tbody id="gwActiveTbody"><tr><td colspan="9" style="text-align:center;color:var(--muted)">加载中…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -651,14 +651,15 @@ async function gwPollActive(){
       const seconds=Math.floor(Number(item.elapsedSeconds)||0);
       const duration=(seconds<60?seconds+' 秒':Math.floor(seconds/60)+' 分 '+seconds%60+' 秒')+(item.completed?'（已完成）':'');
       const input=item.inputTokens===null||item.inputTokens===undefined?'—':(item.inputTokensEstimated?'≈':'')+Number(item.inputTokens).toLocaleString();
+      const cached=item.cachedTokens===null||item.cachedTokens===undefined?'—':Number(item.cachedTokens).toLocaleString()+(Number(item.inputTokens)>0?'（'+(Number(item.cachedTokens)/Number(item.inputTokens)*100).toFixed(1)+'%）':'');
       const output=item.outputTokens===null||item.outputTokens===undefined?'—':(item.outputTokensEstimated?'≈':'')+Number(item.outputTokens).toLocaleString();
-      return `<tr><td><strong>${escapeHtml(item.accountLabel||item.accountId)}</strong></td><td>${escapeHtml(item.platform||'未知')}</td><td>${escapeHtml(item.model||'未指定模型')}</td><td>${escapeHtml(protocols[item.protocol]||item.protocol||'—')}</td><td>${input}</td><td>${output}</td><td>${item.stream?'流式':'非流式'}</td><td>${duration}</td></tr>`;
-    }).join(''):'<tr><td colspan="8" style="text-align:center;color:var(--muted)">当前没有正在处理的请求</td></tr>';
+      return `<tr><td><strong>${escapeHtml(item.accountLabel||item.accountId)}</strong></td><td>${escapeHtml(item.platform||'未知')}</td><td>${escapeHtml(item.model||'未指定模型')}</td><td>${escapeHtml(protocols[item.protocol]||item.protocol||'—')}</td><td>${input}</td><td>${cached}</td><td>${output}</td><td>${item.stream?'流式':'非流式'}</td><td>${duration}</td></tr>`;
+    }).join(''):'<tr><td colspan="9" style="text-align:center;color:var(--muted)">当前没有正在处理的请求</td></tr>';
   }catch(e){
     if(gwActiveController!==controller) return;
     document.getElementById('gwActiveCount').textContent='—';
     document.getElementById('gwActiveHint').textContent='状态更新失败，正在自动重试';
-    document.getElementById('gwActiveTbody').innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--muted)">暂时无法获取当前并发</td></tr>';
+    document.getElementById('gwActiveTbody').innerHTML='<tr><td colspan="9" style="text-align:center;color:var(--muted)">暂时无法获取当前并发</td></tr>';
   }finally{
     clearTimeout(timeout);
     if(gwActiveController===controller){
