@@ -557,6 +557,65 @@ def gateway_category_for_account(acc):
     source = acc.get("source", "") if isinstance(acc, dict) else ""
     return SOURCE_TO_CATEGORY.get(source, "agentPlan")
 
+
+# Volcengine plan console actions that list models supported by each plan.
+VOLC_MODEL_ACTIONS = {"volcAgent": "ListArkAgentPlanModel", "volcCoding": "ListArkCodingPlanModel"}
+_ark_models_cache = {"models": None, "fetchedAt": 0.0}
+ARK_MODELS_TTL_SECONDS = 600
+
+
+def _volc_console_action_url(action):
+    return "https://console.volcengine.com/api/top/ark/cn-beijing/2024-01-01/%s?" % action
+
+
+def _swap_volc_action(curl_command, action):
+    """Rewrite a saved plan-usage curl to call another Action on the same console API."""
+    rewritten = re.sub(
+        r"(console\.volcengine\.com/api/top/ark/cn-beijing/2024-01-01/)\w+\?",
+        r"\g<1>%s?" % action,
+        curl_command,
+        count=1,
+    )
+    if rewritten == curl_command:
+        raise ValueError("saved curl does not target the Volcengine plan console API")
+    return rewritten
+
+
+def fetch_ark_models(accounts, force_refresh=False):
+    """Return model IDs supported by every configured Volcengine plan account."""
+    now = time.monotonic()
+    if not force_refresh and _ark_models_cache["models"] is not None \
+            and now - _ark_models_cache["fetchedAt"] < ARK_MODELS_TTL_SECONDS:
+        return _ark_models_cache["models"]
+    common = None
+    for aid, account in accounts.items():
+        if not isinstance(account, dict):
+            continue
+        source = account.get("source", "")
+        action = VOLC_MODEL_ACTIONS.get(source)
+        curl_command = str(account.get("curl") or "").strip()
+        if not action or not curl_command:
+            continue
+        try:
+            status, body, _ = execute_curl(_swap_volc_action(curl_command, action))
+            if not is_success_status(status):
+                continue
+            datas = (((json.loads(body) or {}).get("Result")) or {}).get("Datas") or []
+            model_ids = {str(item.get("ModelID") or "").strip() for item in datas
+                         if isinstance(item, dict) and str(item.get("ModelID") or "").strip()}
+            if not model_ids:
+                continue
+            common = model_ids if common is None else (common & model_ids)
+        except (ValueError, TypeError, AttributeError, OSError, json.JSONDecodeError) as error:
+            log.warning("gw model list refresh for %s failed: %s", aid, error)
+            continue
+    if common is None:
+        return None
+    models = sorted(common)
+    _ark_models_cache["models"] = models
+    _ark_models_cache["fetchedAt"] = now
+    return models
+
 _gateway_cooldowns = {}  # account_id -> expiry epoch
 _gateway_stats = {"total_requests": 0, "by_account": {}}
 _gateway_active = {}
@@ -2498,6 +2557,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/gateway/active":
             self.send_json(gateway_active_snapshot())
             return
+        if self.path == "/api/gateway/models":
+            self.handle_gateway_model_list()
+            return
         if self.path.split("?")[0] == "/api/logs":
             self.handle_logs_get()
             return
@@ -3223,10 +3285,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.wfile.write(body)
             return
         # Upstream does not support /models (e.g. Volcengine plan endpoints);
-        # return a static list based on configured default model.
+        # return the cached plan model list, falling back to the default model.
         default_model = str(config.get("defaultModel", "")).strip()
-        models = []
-        if default_model:
+        plan_models = fetch_ark_models(load_requests(self.requests_path)) or []
+        models = [{"id": model, "object": "model", "created": 0, "owned_by": "gateway"}
+                  for model in plan_models]
+        if default_model and default_model not in {item["id"] for item in models}:
             models.append({"id": default_model, "object": "model", "created": 0, "owned_by": "gateway"})
         static = {"object": "list", "data": models}
         body = json.dumps(static, ensure_ascii=False).encode("utf-8")
@@ -3235,6 +3299,15 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def handle_gateway_model_list(self):
+        accounts = load_requests(self.requests_path)
+        models = fetch_ark_models(accounts)
+        if models is None:
+            models = []
+        self.send_json({"models": models,
+                        "fetchedAt": _ark_models_cache["fetchedAt"] or None,
+                        "ttlSeconds": ARK_MODELS_TTL_SECONDS if models else 0})
 
     def handle_gateway_config_get(self):
         config = load_gateway_config()
