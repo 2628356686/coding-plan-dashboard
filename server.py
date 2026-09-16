@@ -2654,7 +2654,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.send_error(401, "invalid gateway api key")
             return
         platform = detect_gateway_agent_platform(self.headers)
-        codex_responses = inbound_format == "responses" and is_codex_gateway_platform(platform)
+        responses_inbound = inbound_format == "responses"
         try:
             body, _raw = self._gateway_read_body()
             if not isinstance(body, dict):
@@ -2664,7 +2664,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     body, inbound_format, config.get("codexSystemPrompt", ""))
             tool_context = {} if inbound_format == "responses" else None
             responses_body = responses_to_openai(body, tool_context) if inbound_format == "responses" else None
-            reasoning = body.get("reasoning") if codex_responses else None
+            reasoning = body.get("reasoning") if responses_inbound else None
             if reasoning is None:
                 reasoning = {}
             if not isinstance(reasoning, dict):
@@ -2675,7 +2675,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             effort = reasoning.get("effort")
             if effort is not None and (not isinstance(effort, str) or not effort.strip()):
                 raise ValueError("reasoning.effort must be a non-empty string")
-            include_reasoning = codex_responses and summary != "none"
+            include_reasoning = responses_inbound and summary != "none"
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             self._gateway_write_json(400, {"error": {"type": "invalid_request_error", "message": str(exc)}})
             return
@@ -2740,7 +2740,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     upstream_body = dict(body)
                 if not upstream_body.get("model") and model:
                     upstream_body["model"] = model
-                if codex_responses and upstream_protocol == "openai" and effort is not None:
+                if responses_inbound and upstream_protocol == "openai" and effort is not None:
                     # Chat uses a flat effort field. Preserve the requested value;
                     # supported levels depend on the configured upstream model.
                     upstream_body["reasoning_effort"] = effort

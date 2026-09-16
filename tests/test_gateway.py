@@ -474,7 +474,7 @@ class GatewayProtocolsTest(unittest.TestCase):
                     ({'Originator': 'Codex Desktop'}, 'auto', True),
                     ({'User-Agent': 'codex_cli_rs/1.0'}, 'detailed', True),
                     ({'Originator': 'Codex Desktop'}, 'none', False),
-                    ({'Originator': 'ZCode'}, 'auto', False),
+                    ({'Originator': 'ZCode'}, 'auto', True),
                 ):
                     with self.subTest(upstream=upstream, stream=stream, headers=client_headers, summary=summary):
                         if upstream == 'openai':
@@ -508,7 +508,7 @@ class GatewayProtocolsTest(unittest.TestCase):
                             self.assertEqual(output[0]['summary'][0]['text'], 'synthetic analysis')
                         self.assertEqual(output[-1]['content'][0]['text'], 'answer')
                         sent = self.requests[-1][1]
-                        if upstream == 'openai' and client_headers.get('Originator') != 'ZCode':
+                        if upstream == 'openai':
                             self.assertEqual(sent['reasoning_effort'], 'high')
                         else:
                             self.assertNotIn('reasoning_effort', sent)
