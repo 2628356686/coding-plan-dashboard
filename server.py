@@ -99,6 +99,61 @@ VOLC_REGION = "cn-beijing"
 VOLC_SERVICE = "ark"
 VOLC_ACTIONS = {"volcAgent": "GetAgentPlanAFPUsage", "volcCoding": "GetCodingPlanUsage"}
 
+VOLC_MODEL_ACTIONS = {"volcAgent": "ListArkAgentPlanModel", "volcCoding": "ListArkCodingPlanModel"}
+VOLC_ARK_OPENAPI_HOST = "ark.cn-beijing.volcengineapi.com"
+VOLC_OPENAPI_URL = "https://%s/?Action={action}&Version=2024-01-01" % VOLC_ARK_OPENAPI_HOST
+
+
+def _volc_hmac(key, message):
+    return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+
+def volc_sign_request(access_key_id, secret_access_key, action, body=b"{}"):
+    """Build a Volcengine V4-signed request (HMAC-SHA256) for an OpenAPI Action."""
+    now = datetime.now(timezone.utc)
+    x_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_short = now.strftime("%Y%m%d")
+    host = VOLC_ARK_OPENAPI_HOST
+    path = "/"
+    query = "Action=%s&Version=2024-01-01" % (quote(action, safe="-_.~"))
+    body_bytes = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    content_sha256 = hashlib.sha256(body_bytes).hexdigest()
+    canonical_request = "\n".join([
+        "POST", path, query,
+        "content-type:application/json\nhost:" + host + "\nx-content-sha256:" + content_sha256 + "\nx-date:" + x_date,
+        "content-type;host;x-content-sha256;x-date",
+        content_sha256,
+    ])
+    credential_scope = "/".join([date_short, VOLC_REGION, VOLC_SERVICE, "request"])
+    string_to_sign = "\n".join([
+        "HMAC-SHA256",
+        x_date,
+        credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+    k_date = _volc_hmac(secret_access_key.encode("utf-8"), date_short)
+    k_region = _volc_hmac(k_date, VOLC_REGION)
+    k_service = _volc_hmac(k_region, VOLC_SERVICE)
+    k_signing = _volc_hmac(k_service, "request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    authorization = (
+        "HMAC-SHA256 Credential=%s/%s, SignedHeaders=content-type;host;x-content-sha256;x-date, Signature=%s"
+        % (access_key_id, credential_scope, signature)
+    )
+    request = Request(
+        VOLC_OPENAPI_URL.format(action=quote(action, safe="-_.~")),
+        data=body_bytes, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Host": host,
+            "X-Date": x_date,
+            "X-Content-Sha256": content_sha256,
+            "Authorization": authorization,
+        },
+    )
+    return request
+
+
 
 def _volc_norm_query(params):
     query = ""
@@ -558,62 +613,43 @@ def gateway_category_for_account(acc):
     return SOURCE_TO_CATEGORY.get(source, "agentPlan")
 
 
-# Volcengine plan console actions that list models supported by each plan.
-VOLC_MODEL_ACTIONS = {"volcAgent": "ListArkAgentPlanModel", "volcCoding": "ListArkCodingPlanModel"}
-_ark_models_cache = {"models": None, "fetchedAt": 0.0}
+_ark_models_cache = {"models": None, "fetchedAt": 0.0, "credentialKey": None}
 ARK_MODELS_TTL_SECONDS = 600
 
 
-def _volc_console_action_url(action):
-    return "https://console.volcengine.com/api/top/ark/cn-beijing/2024-01-01/%s?" % action
-
-
-def _swap_volc_action(curl_command, action):
-    """Rewrite a saved plan-usage curl to call another Action on the same console API."""
-    rewritten = re.sub(
-        r"(console\.volcengine\.com/api/top/ark/cn-beijing/2024-01-01/)\w+\?",
-        r"\g<1>%s?" % action,
-        curl_command,
-        count=1,
-    )
-    if rewritten == curl_command:
-        raise ValueError("saved curl does not target the Volcengine plan console API")
-    return rewritten
-
-
-def fetch_ark_models(accounts, force_refresh=False):
-    """Return model IDs supported by every configured Volcengine plan account."""
+def fetch_ark_models(config, force_refresh=False):
+    """Return model IDs supported by both Volcengine plans via V4-signed OpenAPI."""
     now = time.monotonic()
+    ak = str(config.get("volcAccessKeyId", "") or "").strip()
+    sk = str(config.get("volcSecretAccessKey", "") or "").strip()
+    if not ak or not sk:
+        return None
+    credential_key = hashlib.sha256((ak + "\0" + sk).encode("utf-8")).hexdigest()
     if not force_refresh and _ark_models_cache["models"] is not None \
+            and _ark_models_cache.get("credentialKey") == credential_key \
             and now - _ark_models_cache["fetchedAt"] < ARK_MODELS_TTL_SECONDS:
         return _ark_models_cache["models"]
     common = None
-    for aid, account in accounts.items():
-        if not isinstance(account, dict):
-            continue
-        source = account.get("source", "")
-        action = VOLC_MODEL_ACTIONS.get(source)
-        curl_command = str(account.get("curl") or "").strip()
-        if not action or not curl_command:
-            continue
+    for action in VOLC_MODEL_ACTIONS.values():
         try:
-            status, body, _ = execute_curl(_swap_volc_action(curl_command, action))
-            if not is_success_status(status):
-                continue
-            datas = (((json.loads(body) or {}).get("Result")) or {}).get("Datas") or []
+            request = volc_sign_request(ak, sk, action)
+            with urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8", "replace"))
+            datas = ((payload.get("Result") or {}).get("Datas")) or []
             model_ids = {str(item.get("ModelID") or "").strip() for item in datas
                          if isinstance(item, dict) and str(item.get("ModelID") or "").strip()}
             if not model_ids:
-                continue
+                return None
             common = model_ids if common is None else (common & model_ids)
-        except (ValueError, TypeError, AttributeError, OSError, json.JSONDecodeError) as error:
-            log.warning("gw model list refresh for %s failed: %s", aid, error)
-            continue
+        except (ValueError, TypeError, KeyError, OSError, HTTPError, URLError, json.JSONDecodeError) as error:
+            log.warning("gw model list refresh via %s failed: %s", action, error)
+            return None
     if common is None:
         return None
     models = sorted(common)
     _ark_models_cache["models"] = models
     _ark_models_cache["fetchedAt"] = now
+    _ark_models_cache["credentialKey"] = credential_key
     return models
 
 _gateway_cooldowns = {}  # account_id -> expiry epoch
@@ -1016,6 +1052,8 @@ def load_gateway_config():
         "enabled": False,
         "port": None,
         "apiKey": "",
+        "volcAccessKeyId": "",
+        "volcSecretAccessKey": "",
         "defaultModel": "",
         "maxRetries": 3,
         "codexSystemPrompt": "",
@@ -3287,7 +3325,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         # Upstream does not support /models (e.g. Volcengine plan endpoints);
         # return the cached plan model list, falling back to the default model.
         default_model = str(config.get("defaultModel", "")).strip()
-        plan_models = fetch_ark_models(load_requests(self.requests_path)) or []
+        plan_models = fetch_ark_models(config) or []
         models = [{"id": model, "object": "model", "created": 0, "owned_by": "gateway"}
                   for model in plan_models]
         if default_model and default_model not in {item["id"] for item in models}:
@@ -3301,8 +3339,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def handle_gateway_model_list(self):
-        accounts = load_requests(self.requests_path)
-        models = fetch_ark_models(accounts)
+        config = load_gateway_config()
+        models = fetch_ark_models(config)
         if models is None:
             models = []
         self.send_json({"models": models,
@@ -3318,6 +3356,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if not reveal:
                 masked["apiKey"] = mask_secret(masked["apiKey"])
             masked["hasApiKey"] = True
+        if masked.get("volcSecretAccessKey"):
+            if not reveal:
+                masked["volcSecretAccessKey"] = mask_secret(masked["volcSecretAccessKey"])
+            masked["hasVolcSecretAccessKey"] = True
         self.send_json(masked)
 
     def handle_gateway_config_post(self, payload):
@@ -3336,7 +3378,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 except OSError as error:
                     raise ValueError("port %d cannot be bound: %s" % (target, error)) from None
             config["port"] = port
-        for key in ("enabled", "apiKey", "defaultModel", "maxRetries"):
+        for key in ("enabled", "apiKey", "defaultModel", "maxRetries",
+                    "volcAccessKeyId", "volcSecretAccessKey"):
             if key in payload:
                 config[key] = payload[key]
         if "codexSystemPrompt" in payload:

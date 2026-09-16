@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
+from urllib.parse import parse_qsl, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -806,6 +807,48 @@ class GatewayProtocolsTest(unittest.TestCase):
 
 
 class PortSettingTest(unittest.TestCase):
+    def setUp(self):
+        server._ark_models_cache.update({'models': None, 'fetchedAt': 0.0, 'credentialKey': None})
+
+    def test_volc_model_request_uses_regional_ark_endpoint_and_v4_headers(self):
+        request = server.volc_sign_request('test-ak', 'test-sk', 'ListArkCodingPlanModel')
+        self.assertEqual(
+            request.full_url,
+            'https://ark.cn-beijing.volcengineapi.com/?Action=ListArkCodingPlanModel&Version=2024-01-01',
+        )
+        self.assertEqual(request.get_method(), 'POST')
+        self.assertEqual(request.data, b'{}')
+        self.assertEqual(request.get_header('Host'), 'ark.cn-beijing.volcengineapi.com')
+        self.assertTrue(request.get_header('X-date'))
+        self.assertTrue(request.get_header('X-content-sha256'))
+        self.assertIn('Credential=test-ak/', request.get_header('Authorization'))
+
+    def test_fetch_ark_models_returns_only_models_supported_by_both_plans(self):
+        payloads = {
+            'ListArkAgentPlanModel': {'Result': {'Datas': [
+                {'ModelID': 'shared'}, {'ModelID': 'agent-only'}]}},
+            'ListArkCodingPlanModel': {'Result': {'Datas': [
+                {'ModelID': 'shared'}, {'ModelID': 'coding-only'}]}},
+        }
+
+        def open_request(request, timeout):
+            action = dict(parse_qsl(urlparse(request.full_url).query))['Action']
+            return io.BytesIO(json.dumps(payloads[action]).encode())
+
+        config = {'volcAccessKeyId': 'test-ak', 'volcSecretAccessKey': 'test-sk'}
+        with patch.object(server, 'urlopen', side_effect=open_request) as mocked:
+            self.assertEqual(server.fetch_ark_models(config), ['shared'])
+        self.assertEqual(mocked.call_count, 2)
+
+    def test_fetch_ark_models_fails_closed_when_either_plan_query_fails(self):
+        success = io.BytesIO(json.dumps({'Result': {'Datas': [{'ModelID': 'shared'}]}}).encode())
+        with patch.object(server, 'urlopen', side_effect=[success, URLError('unavailable')]):
+            models = server.fetch_ark_models(
+                {'volcAccessKeyId': 'test-ak', 'volcSecretAccessKey': 'test-sk'},
+                force_refresh=True,
+            )
+        self.assertIsNone(models)
+
     def test_normalize_gateway_port(self):
         cases = {None: None, '': None, 0: None, -1: None, 70000: None, 'abc': None,
                  1: 1, 65535: 65535, 8080: 8080, '8080': 8080}
