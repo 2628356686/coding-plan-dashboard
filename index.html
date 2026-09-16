@@ -144,8 +144,8 @@ body.locked .card-actions button,body.locked .reorder-btns button,body.locked #c
     <p class="hint" id="gwActiveHint" aria-live="polite">每秒自动更新，显示正在处理请求的账号和模型</p>
     <div class="accounts-table-wrap">
       <table class="accounts-table">
-        <thead><tr><th>账号</th><th>使用平台</th><th>模型</th><th>接口协议</th><th>输出方式</th><th>已持续</th></tr></thead>
-        <tbody id="gwActiveTbody"><tr><td colspan="6" style="text-align:center;color:var(--muted)">加载中…</td></tr></tbody>
+        <thead><tr><th>账号</th><th>使用平台</th><th>模型</th><th>接口协议</th><th>输入 Token</th><th>输出 Token</th><th>输出方式</th><th>已持续</th></tr></thead>
+        <tbody id="gwActiveTbody"><tr><td colspan="8" style="text-align:center;color:var(--muted)">加载中…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -297,6 +297,7 @@ const SOURCES={
 };
 const DISPLAY_TYPE={codexUsage:'codex',codexCredits:'codex',codexNewApi:'codex',codexNewApiCredits:'codex',minimax:'minimax',volcCoding:'volcCoding',volcAgent:'volcAgent',kimi:'kimi',longcat:'longcat',qianwen:'qianwen',googleAi:'googleAi'};
 const state={};
+let gatewayTokenTotals=null;
 const refreshErrors={};
 let requestDefinitions={};
 let locked=true;
@@ -305,6 +306,7 @@ const $=s=>document.querySelector(s);
 const now=()=>new Date().toISOString();
 const fmtDate=value=>value?new Date(value).toLocaleString('zh-CN',{hour12:false}):'未提供';
 const num=value=>Number.isFinite(Number(value))?Number(value):0;
+function fmtTokens(value){const n=Number(value);if(!Number.isFinite(n))return '—';const abs=Math.abs(n);if(abs<1e3)return n.toLocaleString();if(abs<1e6)return (n/1e3).toFixed(1)+'K';if(abs<1e9)return (n/1e6).toFixed(1)+'M';if(abs<1e12)return (n/1e9).toFixed(2)+'B';return (n/1e12).toFixed(2)+'T'}
 function firstNumber(value,keys){for(const key of keys){const candidate=value?.[key];if(typeof candidate==='number'&&Number.isFinite(candidate))return candidate;if(typeof candidate==='string'&&candidate.trim()!==''&&Number.isFinite(Number(candidate)))return Number(candidate)}return null}
 function firstValue(value,keys){for(const key of keys)if(value&&value[key]!==undefined&&value[key]!==null)return value[key];return null}
 function unwrap(value){return value?.data&&typeof value.data==='object'?value.data:(value||{})}
@@ -370,8 +372,8 @@ function render(){
   const accounts=getOrderedAccounts().filter(([,acc])=>acc.source!=='codexNewApiCredits'&&!acc.dashboardHidden);
   const items=accounts.map(([id])=>state[id]).filter(Boolean);
   const total=items.reduce((sum,item)=>sum+num(item.limit),0),used=items.reduce((sum,item)=>sum+num(item.used),0);
-  const summary=[['账号数',`${accounts.length}`,'已保存'],['总限额',total?total.toLocaleString():'-','合计'],['已使用',used?used.toLocaleString():'-','合计'],['最近更新',items.length?fmtDate(items.map(x=>x.updatedAt).filter(Boolean).sort().at(-1)):'-','本机时间']];
-  $('#summary').innerHTML=summary.map(([a,b,c])=>`<div class="stat"><label>${a}</label><strong>${b}</strong><small>${c}</small></div>`).join('');
+  const summary=[['账号数',`${accounts.length}`,'已保存'],['总限额',total?total.toLocaleString():'-','合计'],['总计 Token',gatewayTokenTotals===null?'—':fmtTokens(gatewayTokenTotals),'仅网关转发'],['最近更新',items.length?fmtDate(items.map(x=>x.updatedAt).filter(Boolean).sort().at(-1)):'-','本机时间']];
+  $('#summary').innerHTML=summary.map(([a,b,c],i)=>`<div class="stat"><label>${a}</label><strong${i===2?' id="gwTotalTokens"':''}>${b}</strong><small>${c}</small></div>`).join('');
   renderRefreshAlert();
   $('#cards').innerHTML=accounts.map(([id,acc])=>{
     const source=SOURCES[acc.source]||{name:acc.source,sub:'',logo:'?',className:''};
@@ -639,19 +641,24 @@ async function gwPollActive(){
     const status=await r.json();
     if(gwActiveController!==controller) return;
     const requests=status.activeRequests||[];
+    gatewayTokenTotals=Number(status.tokenTotals?.totalTokens)||0;
+    const totalNode=document.getElementById('gwTotalTokens');
+    if(totalNode){totalNode.textContent=fmtTokens(gatewayTokenTotals);totalNode.title=gatewayTokenTotals.toLocaleString();}
     document.getElementById('gwActiveCount').textContent=status.activeCount+' 个请求';
-    document.getElementById('gwActiveHint').textContent='每秒自动更新 · 同一账号的多个请求分别显示';
+    document.getElementById('gwActiveHint').textContent='每秒自动更新 · 进行中显示估算 Token，完成后短暂显示上游真实 usage';
     const protocols={openai:'OpenAI Chat',anthropic:'Anthropic Messages',responses:'Responses'};
     document.getElementById('gwActiveTbody').innerHTML=requests.length?requests.map(item=>{
       const seconds=Math.floor(Number(item.elapsedSeconds)||0);
-      const duration=seconds<60?seconds+' 秒':Math.floor(seconds/60)+' 分 '+seconds%60+' 秒';
-      return `<tr><td><strong>${escapeHtml(item.accountLabel||item.accountId)}</strong></td><td>${escapeHtml(item.platform||'未知')}</td><td>${escapeHtml(item.model||'未指定模型')}</td><td>${escapeHtml(protocols[item.protocol]||item.protocol||'—')}</td><td>${item.stream?'流式':'非流式'}</td><td>${duration}</td></tr>`;
-    }).join(''):'<tr><td colspan="6" style="text-align:center;color:var(--muted)">当前没有正在处理的请求</td></tr>';
+      const duration=(seconds<60?seconds+' 秒':Math.floor(seconds/60)+' 分 '+seconds%60+' 秒')+(item.completed?'（已完成）':'');
+      const input=item.inputTokens===null||item.inputTokens===undefined?'—':(item.inputTokensEstimated?'≈':'')+Number(item.inputTokens).toLocaleString();
+      const output=item.outputTokens===null||item.outputTokens===undefined?'—':(item.outputTokensEstimated?'≈':'')+Number(item.outputTokens).toLocaleString();
+      return `<tr><td><strong>${escapeHtml(item.accountLabel||item.accountId)}</strong></td><td>${escapeHtml(item.platform||'未知')}</td><td>${escapeHtml(item.model||'未指定模型')}</td><td>${escapeHtml(protocols[item.protocol]||item.protocol||'—')}</td><td>${input}</td><td>${output}</td><td>${item.stream?'流式':'非流式'}</td><td>${duration}</td></tr>`;
+    }).join(''):'<tr><td colspan="8" style="text-align:center;color:var(--muted)">当前没有正在处理的请求</td></tr>';
   }catch(e){
     if(gwActiveController!==controller) return;
     document.getElementById('gwActiveCount').textContent='—';
     document.getElementById('gwActiveHint').textContent='状态更新失败，正在自动重试';
-    document.getElementById('gwActiveTbody').innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--muted)">暂时无法获取当前并发</td></tr>';
+    document.getElementById('gwActiveTbody').innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--muted)">暂时无法获取当前并发</td></tr>';
   }finally{
     clearTimeout(timeout);
     if(gwActiveController===controller){

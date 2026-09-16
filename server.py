@@ -560,8 +560,10 @@ def gateway_category_for_account(acc):
 _gateway_cooldowns = {}  # account_id -> expiry epoch
 _gateway_stats = {"total_requests": 0, "by_account": {}}
 _gateway_active = {}
+_gateway_recent = {}
 _gateway_active_lock = RLock()
 _gateway_quota_cache = {}
+GATEWAY_RECENT_COMPLETED_SECONDS = 8
 
 
 class GatewayRetry(Exception):
@@ -634,17 +636,108 @@ class GatewayStreamGuard:
                 yield line + b"\n"
 
 
-def gateway_native_stream(stream, protocol):
+class GatewaySSELogger:
+    """Log SSE structure without recording response content or credentials."""
+
+    def __init__(self, request_id, protocol):
+        self.request_id = (request_id or "unknown")[:12]
+        self.protocol = protocol
+        self.started = time.monotonic()
+        self.last_report = self.started
+        self.counts = {}
+        self.terminal = None
+
+    def observe(self, data):
+        kind = "unknown"
+        event = None
+        if data == "[DONE]":
+            kind = "done"
+        else:
+            try:
+                event = json.loads(data)
+            except (ValueError, TypeError):
+                event = None
+            if isinstance(event, dict):
+                raw_kind = str(event.get("type") or "chat.chunk")
+                kind = raw_kind if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", raw_kind) else "unknown"
+                if event.get("usage") and not event.get("choices"):
+                    kind = "usage"
+                elif event.get("choices"):
+                    choice = event["choices"][0] if event["choices"] else {}
+                    delta = choice.get("delta") or {}
+                    if choice.get("finish_reason"):
+                        kind = "chat.finish"
+                    elif not delta:
+                        kind = "heartbeat"
+        self.counts[kind] = self.counts.get(kind, 0) + 1
+        if self.counts[kind] == 1:
+            log.info("gw sse request=%s protocol=%s event=%s", self.request_id, self.protocol, kind)
+        now = time.monotonic()
+        if now - self.last_report >= 30:
+            log.info("gw sse request=%s active=%.1fs events=%s", self.request_id,
+                     now - self.started, json.dumps(self.counts, sort_keys=True))
+            self.last_report = now
+        if kind in ("done", "message_stop", "response.completed", "response.incomplete", "response.failed"):
+            self.terminal = kind
+        return event
+
+    def heartbeat(self):
+        self.counts["heartbeat"] = self.counts.get("heartbeat", 0) + 1
+        if self.counts["heartbeat"] == 1:
+            log.info("gw sse request=%s protocol=%s event=heartbeat", self.request_id, self.protocol)
+        now = time.monotonic()
+        if now - self.last_report >= 30:
+            log.info("gw sse request=%s active=%.1fs events=%s", self.request_id,
+                     now - self.started, json.dumps(self.counts, sort_keys=True))
+            self.last_report = now
+
+    def finish(self, reason=None):
+        log.info("gw sse request=%s end=%s duration=%.1fs events=%s", self.request_id,
+                 reason or self.terminal or "transport_closed", time.monotonic() - self.started,
+                 json.dumps(self.counts, sort_keys=True))
+
+
+def gateway_native_stream(stream, protocol, usage_callback=None, sse_logger=None, progress_callback=None):
     """Forward SSE verbatim and finish without waiting for upstream TCP EOF."""
     data = []
     for raw_line in stream:
         yield raw_line
         line = raw_line.rstrip(b"\r\n")
-        if line.startswith(b"data:"):
+        if line.startswith(b":"):
+            if sse_logger:
+                sse_logger.heartbeat()
+        elif line.startswith(b"data:"):
             data.append(line[5:].lstrip(b" "))
         elif not line:
             value = b"\n".join(data)
             data = []
+            decoded = value.decode("utf-8", errors="replace")
+            event = sse_logger.observe(decoded) if sse_logger else None
+            if event is None and value not in (b"", b"[DONE]"):
+                try:
+                    event = json.loads(value)
+                except (ValueError, UnicodeDecodeError):
+                    event = None
+            if isinstance(event, dict) and usage_callback:
+                usage = event.get("usage")
+                if protocol == "anthropic" and event.get("type") == "message_start":
+                    usage = (event.get("message") or {}).get("usage")
+                if usage:
+                    usage_callback(usage)
+            if isinstance(event, dict) and progress_callback:
+                fragments = []
+                if protocol == "openai":
+                    for choice in event.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        fragments.extend((delta.get("content"), delta.get("reasoning_content"), delta.get("reasoning")))
+                        fragments.extend((call.get("function") or {}).get("arguments")
+                                         for call in delta.get("tool_calls") or [])
+                else:
+                    delta = event.get("delta") or {}
+                    fragments.extend((delta.get("text"), delta.get("thinking"), delta.get("partial_json")))
+                for fragment in fragments:
+                    if isinstance(fragment, str) and fragment:
+                        progress_callback(fragment)
             if protocol == "openai" and value == b"[DONE]":
                 return
             if protocol == "anthropic" and value:
@@ -728,8 +821,11 @@ def reserve_gateway_account(accounts, snapshot, model, protocol, stream, platfor
         with _gateway_active_lock:
             aid, account = select_gateway_account(accounts, gateway_routing_snapshot(snapshot))
             if aid:
-                stack.enter_context(track_gateway_request(aid, account, model, protocol, stream, platform))
-        yield aid, account
+                request_id = stack.enter_context(
+                    track_gateway_request(aid, account, model, protocol, stream, platform))
+            else:
+                request_id = None
+        yield aid, account, request_id
 
 
 @contextmanager
@@ -740,25 +836,109 @@ def track_gateway_request(account_id, account, model, protocol, stream, platform
         "accountLabel": account.get("label") or account.get("accountId") or account_id,
         "model": model, "protocol": protocol, "stream": bool(stream),
         "platform": platform,
+        "inputTokens": None, "outputTokens": 0,
+        "inputTokensEstimated": True, "outputTokensEstimated": True,
         "startedAt": now_iso(), "startedMonotonic": time.monotonic(),
     }
     with _gateway_active_lock:
         _gateway_active[request_id] = entry
     try:
-        yield
+        yield request_id
     finally:
         with _gateway_active_lock:
-            _gateway_active.pop(request_id, None)
+            completed = _gateway_active.pop(request_id, None)
+            if completed is not None:
+                completed = dict(completed)
+                completed["elapsedSeconds"] = round(
+                    max(0, time.monotonic() - completed.pop("startedMonotonic")), 1)
+                completed["completed"] = True
+                completed["completedMonotonic"] = time.monotonic()
+                _gateway_recent[request_id] = completed
 
 
 def gateway_active_snapshot():
     with _gateway_active_lock:
         now = time.monotonic()
+        expired = [request_id for request_id, entry in _gateway_recent.items()
+                   if now - entry["completedMonotonic"] >= GATEWAY_RECENT_COMPLETED_SECONDS]
+        for request_id in expired:
+            _gateway_recent.pop(request_id, None)
         active = [dict(
             {k: v for k, v in entry.items() if k != "startedMonotonic"},
             elapsedSeconds=round(max(0, now - entry["startedMonotonic"]), 1),
         ) for entry in _gateway_active.values()]
-    return {"activeCount": len(active), "activeRequests": active}
+        recent = [{k: v for k, v in entry.items() if k != "completedMonotonic"}
+                  for entry in _gateway_recent.values()]
+        totals = {
+            "inputTokens": _gateway_stats.get("input_tokens", 0),
+            "outputTokens": _gateway_stats.get("output_tokens", 0),
+            "totalTokens": _gateway_stats.get("total_tokens", 0),
+        }
+    return {"activeCount": len(active), "activeRequests": active + recent, "tokenTotals": totals}
+
+
+class GatewayTokenEstimator:
+    """Lightweight display-only estimate; provider usage remains authoritative."""
+
+    def __init__(self):
+        self.ascii_chars = 0
+        self.other_chars = 0
+
+    def add(self, value):
+        if not isinstance(value, str) or not value:
+            return self.tokens
+        self.ascii_chars += sum(ord(char) < 128 for char in value)
+        self.other_chars += sum(ord(char) >= 128 for char in value)
+        return self.tokens
+
+    @property
+    def tokens(self):
+        return int(math.ceil(self.ascii_chars / 4.0 + self.other_chars))
+
+
+def estimate_gateway_tokens(value):
+    estimator = GatewayTokenEstimator()
+    return estimator.add(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))
+
+
+def normalize_gateway_usage(usage):
+    """Return non-negative input/output token counts from supported providers."""
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+    output_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
+    if not isinstance(input_tokens, (int, float)) and not isinstance(output_tokens, (int, float)):
+        return None
+    input_tokens = max(0, int(input_tokens or 0))
+    output_tokens = max(0, int(output_tokens or 0))
+    return {"inputTokens": input_tokens, "outputTokens": output_tokens,
+            "totalTokens": max(0, int(usage.get("total_tokens", input_tokens + output_tokens) or 0))}
+
+
+def update_gateway_request_usage(request_id, usage):
+    """Publish the latest upstream usage on an active request."""
+    normalized = normalize_gateway_usage(usage)
+    if not request_id or normalized is None:
+        return
+    with _gateway_active_lock:
+        entry = _gateway_active.get(request_id)
+        if entry is not None:
+            entry.update(normalized)
+            entry["inputTokensEstimated"] = False
+            entry["outputTokensEstimated"] = False
+
+
+def update_gateway_request_estimate(request_id, input_tokens=None, output_tokens=None):
+    with _gateway_active_lock:
+        entry = _gateway_active.get(request_id)
+        if entry is None:
+            return
+        if input_tokens is not None and entry.get("inputTokensEstimated") is not False:
+            entry["inputTokens"] = max(0, int(input_tokens))
+            entry["inputTokensEstimated"] = True
+        if output_tokens is not None and entry.get("outputTokensEstimated") is not False:
+            entry["outputTokens"] = max(0, int(output_tokens))
+            entry["outputTokensEstimated"] = True
 
 
 def normalize_gateway_port(value):
@@ -905,13 +1085,33 @@ def cooldown_account(account_id, seconds=GATEWAY_COOLDOWN_SECONDS, reason=""):
     log.warning("gw account %s cooldown %ss: %s", account_id, seconds, reason or "unspecified")
 
 
-def record_gateway_request(account_id, platform="unknown"):
+def record_gateway_request(account_id, platform="unknown", usage=None):
+    normalized = normalize_gateway_usage(usage)
     with _gateway_active_lock:
         _gateway_stats["total_requests"] = _gateway_stats.get("total_requests", 0) + 1
         by_acc = _gateway_stats.setdefault("by_account", {})
         by_acc[account_id] = by_acc.get(account_id, 0) + 1
         by_platform = _gateway_stats.setdefault("by_platform", {})
         by_platform[platform] = by_platform.get(platform, 0) + 1
+        if normalized is not None:
+            _gateway_stats["input_tokens"] = _gateway_stats.get("input_tokens", 0) + normalized["inputTokens"]
+            _gateway_stats["output_tokens"] = _gateway_stats.get("output_tokens", 0) + normalized["outputTokens"]
+            _gateway_stats["total_tokens"] = _gateway_stats.get("total_tokens", 0) + normalized["totalTokens"]
+    try:
+        save_gateway_stats(_gateway_stats)
+    except OSError:
+        pass
+
+
+def record_gateway_usage(usage):
+    """Persist one completed gateway response's token usage without recounting it."""
+    normalized = normalize_gateway_usage(usage)
+    if normalized is None:
+        return
+    with _gateway_active_lock:
+        _gateway_stats["input_tokens"] = _gateway_stats.get("input_tokens", 0) + normalized["inputTokens"]
+        _gateway_stats["output_tokens"] = _gateway_stats.get("output_tokens", 0) + normalized["outputTokens"]
+        _gateway_stats["total_tokens"] = _gateway_stats.get("total_tokens", 0) + normalized["totalTokens"]
     try:
         save_gateway_stats(_gateway_stats)
     except OSError:
@@ -1399,12 +1599,15 @@ def openai_to_responses(body, model, tool_context=None, include_reasoning=False)
     }
 
 
-def iter_sse_data(stream):
+def iter_sse_data(stream, sse_logger=None):
     """Read complete SSE frames without waiting for the upstream body to end."""
     data = []
     for raw_line in stream:
         line = raw_line.decode("utf-8").rstrip("\r\n")
-        if not line:
+        if line.startswith(":"):
+            if sse_logger:
+                sse_logger.heartbeat()
+        elif not line:
             if data:
                 yield "\n".join(data)
                 data = []
@@ -1415,7 +1618,8 @@ def iter_sse_data(stream):
         yield "\n".join(data)
 
 
-def gateway_responses_stream(stream, protocol, model, tool_context=None, include_reasoning=False):
+def gateway_responses_stream(stream, protocol, model, tool_context=None, include_reasoning=False,
+                             usage_callback=None, sse_logger=None, progress_callback=None):
     """Translate text and indexed tool argument deltas into Responses events."""
     response = {
         "id": "resp_" + uuid.uuid4().hex, "object": "response",
@@ -1515,7 +1719,8 @@ def gateway_responses_stream(stream, protocol, model, tool_context=None, include
                            output_index=state["output_index"], delta=fragment)
 
     try:
-        for data in iter_sse_data(stream):
+        for data in iter_sse_data(stream, sse_logger):
+            observed = sse_logger.observe(data) if sse_logger else None
             if protocol == "openai" and data == "[DONE]":
                 terminal = True
                 break
@@ -1528,6 +1733,8 @@ def gateway_responses_stream(stream, protocol, model, tool_context=None, include
             if protocol == "openai":
                 if chunk.get("usage"):
                     usage.update(chunk["usage"])
+                    if usage_callback:
+                        usage_callback(usage)
                 for choice in chunk.get("choices", []):
                     if choice.get("index", 0) != 0:
                         continue
@@ -1543,6 +1750,8 @@ def gateway_responses_stream(stream, protocol, model, tool_context=None, include
                 kind = chunk.get("type")
                 if kind == "message_start":
                     usage.update(chunk.get("message", {}).get("usage") or {})
+                    if usage_callback and usage:
+                        usage_callback(usage)
                 elif kind == "content_block_start":
                     block = chunk.get("content_block") or {}
                     if block.get("type") == "tool_use":
@@ -1563,10 +1772,20 @@ def gateway_responses_stream(stream, protocol, model, tool_context=None, include
                         tool_deltas.append((chunk["index"], {"function": {"arguments": delta.get("partial_json", "")}}))
                 elif kind == "message_delta":
                     usage.update(chunk.get("usage") or {})
+                    if usage_callback and usage:
+                        usage_callback(usage)
                     finish_reason = chunk.get("delta", {}).get("stop_reason") or finish_reason
                 elif kind == "message_stop":
                     terminal = True
                     break
+            if progress_callback:
+                for fragment in (text_delta, reasoning_delta):
+                    if fragment:
+                        progress_callback(fragment)
+                for _, call_delta in tool_deltas:
+                    arguments = (call_delta.get("function") or {}).get("arguments")
+                    if isinstance(arguments, str) and arguments:
+                        progress_callback(arguments)
             yield from reasoning_events(reasoning_delta)
             if text_delta or tool_deltas:
                 yield from finish_reasoning()
@@ -2586,7 +2805,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _gateway_stream_openai(self, base_url, path, api_key, body_bytes, protocol="openai", output_protocol=None, model="", tool_context=None, include_reasoning=False):
+    def _gateway_stream_openai(self, base_url, path, api_key, body_bytes, protocol="openai", output_protocol=None,
+                               model="", tool_context=None, include_reasoning=False, request_id=None,
+                               usage_callback=None, progress_callback=None):
         """Make upstream request and stream SSE response back to client in real-time."""
         url = base_url.rstrip("/") + path
         headers = {
@@ -2624,6 +2845,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             return True
         try:
             with GatewayStreamGuard(resp, self.connection) as stream:
+                sse_logger = GatewaySSELogger(request_id, protocol)
                 # Once headers are sent, failures must close this response,
                 # never retry generation or send a second HTTP response.
                 self.close_connection = True
@@ -2633,11 +2855,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.send_header("X-Accel-Buffering", "no")
                 self.send_header("Connection", "close")
                 self.end_headers()
-                events = (gateway_responses_stream(stream, protocol, model, tool_context, include_reasoning)
-                          if output_protocol == "responses" else gateway_native_stream(stream, protocol))
-                for event in events:
-                    self.wfile.write(event)
-                    self.wfile.flush()
+                try:
+                    events = (gateway_responses_stream(stream, protocol, model, tool_context, include_reasoning,
+                                                       usage_callback, sse_logger, progress_callback)
+                              if output_protocol == "responses"
+                              else gateway_native_stream(stream, protocol, usage_callback, sse_logger,
+                                                         progress_callback))
+                    for event in events:
+                        self.wfile.write(event)
+                        self.wfile.flush()
+                finally:
+                    sse_logger.finish(stream.reason)
         except (OSError, HTTPException):
             log.info("gw stream transport closed")
         finally:
@@ -2691,7 +2919,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                  self.path, model or "-", stream, inbound_format, platform or "-")
 
         for _account_attempt in range(max(1, len(accounts))):
-            with reserve_gateway_account(accounts, snapshot, model, inbound_format, stream, platform) as (aid, acc):
+            with reserve_gateway_account(accounts, snapshot, model, inbound_format, stream, platform) as (aid, acc, request_id):
                 if not aid:
                     d = self._gateway_diagnostics(accounts)
                     msg = "no available gateway accounts (accounts may be at concurrency limit, cooling down, or out of quota; total %d, disabled %d, missing apiKey %d)" % (
@@ -2760,20 +2988,42 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 native_stream = stream and inbound_format == upstream_protocol
                 responses_stream = stream and inbound_format == "responses"
                 upstream_body["stream"] = native_stream or responses_stream
+                if upstream_protocol == "openai" and upstream_body["stream"]:
+                    # Chat-compatible upstreams emit final usage only when asked.
+                    stream_options = dict(upstream_body.get("stream_options") or {})
+                    stream_options["include_usage"] = True
+                    upstream_body["stream_options"] = stream_options
                 upstream_bytes = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
+                update_gateway_request_estimate(
+                    request_id, input_tokens=estimate_gateway_tokens(upstream_bytes.decode("utf-8")))
 
                 # Keep the same account and concurrency reservation across retries.
                 for attempt in range(max_retries):
                     # True SSE streaming: bypass buffering, stream directly
                     if native_stream or responses_stream:
                         record_gateway_request(aid, platform)
+                        stream_usage = {}
+                        output_estimator = GatewayTokenEstimator()
+
+                        def capture_usage(value):
+                            if isinstance(value, dict):
+                                stream_usage.update(value)
+                            if normalize_gateway_usage(stream_usage) is not None:
+                                update_gateway_request_usage(request_id, stream_usage)
+
+                        def capture_progress(value):
+                            update_gateway_request_estimate(
+                                request_id, output_tokens=output_estimator.add(value))
                         try:
                             self._gateway_stream_openai(base_url, upstream_path, upstream_key, upstream_bytes,
-                                                        upstream_protocol, inbound_format, model, tool_context, include_reasoning)
+                                                        upstream_protocol, inbound_format, model, tool_context,
+                                                        include_reasoning, request_id, capture_usage,
+                                                        capture_progress)
                         except GatewayRetry as error:
                             self._gateway_retry_account(aid, attempt, max_retries, str(error))
                             last_error = str(error)
                             continue
+                        record_gateway_usage(stream_usage)
                         log.info("gw stream complete via %s in %.1fs", aid, time.monotonic() - started)
                         return
 
@@ -2810,8 +3060,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         self.wfile.write(resp_body)
                         return
 
-                    record_gateway_request(aid, platform)
-
                     # ---- Response conversion: upstream -> inbound protocol ----
                     try:
                         upstream_json = json.loads(resp_text)
@@ -2820,6 +3068,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     if not isinstance(upstream_json, dict) or upstream_json.get("error"):
                         self._gateway_write_json(502, {"error": {"message": "upstream returned an invalid model response"}})
                         return
+                    update_gateway_request_usage(request_id, upstream_json.get("usage"))
+                    record_gateway_request(aid, platform, upstream_json.get("usage"))
 
                     out_model = model or upstream_body.get("model", "")
                     if upstream_protocol == inbound_format:
@@ -3036,6 +3286,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         snapshot = gateway_routing_snapshot(load_snapshot(self.snapshot_path))
         active_counts = {}
         for entry in gateway_active_snapshot()["activeRequests"]:
+            if entry.get("completed"):
+                continue
             aid = entry["accountId"]
             active_counts[aid] = active_counts.get(aid, 0) + 1
         now = time.time()

@@ -94,6 +94,8 @@ class GatewayProtocolsTest(unittest.TestCase):
         self.failures = []
         self.stack.enter_context(patch.dict(server._gateway_cooldowns, {}, clear=True))
         self.stack.enter_context(patch.dict(server._gateway_quota_cache, {}, clear=True))
+        self.stack.enter_context(patch.dict(server._gateway_active, {}, clear=True))
+        self.stack.enter_context(patch.dict(server._gateway_recent, {}, clear=True))
         self.hold_stream = False
         self.hold_response = False
         self.open_stream = False
@@ -996,10 +998,21 @@ class AgentPlatformTest(unittest.TestCase):
         self.assertEqual(server.detect_gateway_agent_platform({}), 'unknown')
 
     def test_active_snapshot_includes_platform(self):
-        with patch.dict(server._gateway_active, {}, clear=True):
-            with server.track_gateway_request('acc', {'label': 'Example'}, 'model', 'openai', True, 'Codex Desktop'):
+        with patch.dict(server._gateway_active, {}, clear=True), \
+             patch.dict(server._gateway_recent, {}, clear=True):
+            with server.track_gateway_request('acc', {'label': 'Example'}, 'model', 'openai', True, 'Codex Desktop') as request_id:
+                server.update_gateway_request_estimate(request_id, input_tokens=11, output_tokens=2)
+                estimated = server.gateway_active_snapshot()['activeRequests'][0]
+                server.update_gateway_request_usage(request_id, {'prompt_tokens': 12, 'completion_tokens': 3})
                 active = server.gateway_active_snapshot()['activeRequests'][0]
+            completed = server.gateway_active_snapshot()['activeRequests'][0]
+        self.assertTrue(estimated['inputTokensEstimated'])
+        self.assertEqual(estimated['outputTokens'], 2)
         self.assertEqual(active['platform'], 'Codex Desktop')
+        self.assertEqual(active['inputTokens'], 12)
+        self.assertEqual(active['outputTokens'], 3)
+        self.assertFalse(active['inputTokensEstimated'])
+        self.assertTrue(completed['completed'])
 
     def test_record_gateway_request_persists_platform_stats(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1010,6 +1023,31 @@ class AgentPlatformTest(unittest.TestCase):
                 saved = json.loads(stats_path.read_text(encoding='utf-8'))
         self.assertEqual(saved['total_requests'], 1)
         self.assertEqual(saved['by_platform'], {'Codex Desktop': 1})
+
+    def test_gateway_usage_is_persisted_and_exposed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stats_path = pathlib.Path(tmp) / 'gateway_stats.json'
+            initial = {'total_requests': 0, 'by_account': {}}
+            with patch.object(server, 'GATEWAY_STATS_PATH', stats_path), \
+                 patch.dict(server._gateway_stats, initial, clear=True):
+                server.record_gateway_request('acc', 'Codex Desktop',
+                                              {'prompt_tokens': 10, 'completion_tokens': 4, 'total_tokens': 14})
+                server.record_gateway_usage({'input_tokens': 2, 'output_tokens': 1})
+                totals = server.gateway_active_snapshot()['tokenTotals']
+                saved = json.loads(stats_path.read_text(encoding='utf-8'))
+        self.assertEqual(totals, {'inputTokens': 12, 'outputTokens': 5, 'totalTokens': 17})
+        self.assertEqual(saved['total_tokens'], 17)
+
+    def test_sse_logger_records_structure_without_payload(self):
+        logger = server.GatewaySSELogger('request-secret', 'openai')
+        with self.assertLogs(server.log, level='INFO') as captured:
+            logger.observe('{"choices":[{"delta":{"content":"sensitive answer"}}]}')
+            logger.observe('[DONE]')
+            logger.finish()
+        output = '\n'.join(captured.output)
+        self.assertIn('event=chat.chunk', output)
+        self.assertIn('end=done', output)
+        self.assertNotIn('sensitive answer', output)
 
 
 class RoutingTest(unittest.TestCase):
